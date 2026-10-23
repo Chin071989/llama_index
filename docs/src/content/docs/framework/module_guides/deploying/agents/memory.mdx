@@ -254,12 +254,14 @@ By default, the `Memory` class is using an in-memory SQLite database. You can pl
 You can customize the table name, and also optionally pass in an async engine directly. This is useful for managing your own connection pool.
 
 ```python
+import os
+
 from llama_index.core.memory import Memory
 
 memory = Memory.from_defaults(
     session_id="my_session",
     token_limit=40000,
-    async_database_uri="postgresql+asyncpg://postgres:mark90@localhost:5432/postgres",
+    async_database_uri=os.environ["POSTGRES_ASYNC_DATABASE_URI"],
     # Optional: specify a table name
     # table_name="memory_table",
     # Optional: pass in an async engine directly

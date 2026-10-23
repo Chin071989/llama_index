@@ -26,12 +26,13 @@ Examples:
 1.  MonsterAPI Private LLM Deployment use case
 
     ````python
+    import os
     from llama_index.llms.monsterapi import MonsterLLM
 
         llm = MonsterLLM(
             model = "<Replace with basemodel used to deploy>",
-            api_base="https://ecc7deb6-26e0-419b-a7f2-0deb934af29a.monsterapi.ai",
-            api_key="a0f8a6ba-c32f-4407-af0c-169f1915490c",
+            api_base=os.environ["MONSTER_API_BASE"],
+            api_key=os.environ["MONSTER_API_KEY"],
             temperature=0.75,
         )
 

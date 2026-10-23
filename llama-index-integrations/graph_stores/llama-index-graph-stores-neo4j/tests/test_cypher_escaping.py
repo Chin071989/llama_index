@@ -116,3 +116,19 @@ def test_get_triplets_delete_get_and_vector_query_escape_identifiers():
     for cypher in queries:
         stripped = _strip_identifiers(cypher)
         assert "MATCH (m)" not in stripped
+
+
+def test_upsert_relations_rejects_backtick_labels():
+    import pytest
+    from llama_index.core.graph_stores.types import Relation
+
+    store = _store()
+    for label in (PAYLOAD, "a\\u0060b"):
+        with pytest.raises(ValueError):
+            store.upsert_relations(
+                [Relation(label=label, source_id="a", target_id="b")]
+            )
+    store.structured_query.assert_not_called()
+
+    store.upsert_relations([Relation(label="WORKS_AT", source_id="a", target_id="b")])
+    assert store.structured_query.call_count == 1

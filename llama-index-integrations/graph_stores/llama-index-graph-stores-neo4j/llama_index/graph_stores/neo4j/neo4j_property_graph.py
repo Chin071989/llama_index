@@ -420,6 +420,13 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
 
     def upsert_relations(self, relations: List[Relation]) -> None:
         """Add relations."""
+        for r in relations:
+            # apoc.merge.relationship interpolates the type into Cypher unescaped
+            if "`" in escape_cypher_identifier(r.label)[1:-1]:
+                raise ValueError(
+                    f"Relation label {r.label!r} contains a backtick, which is not "
+                    "allowed in Neo4j relationship types."
+                )
         params = [r.dict() for r in relations]
         for index in range(0, len(params), CHUNK_SIZE):
             chunked_params = params[index : index + CHUNK_SIZE]

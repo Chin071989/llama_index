@@ -10,12 +10,17 @@ from llama_index.core.schema import (
 )
 from llama_index.core.vector_stores.types import (
     ExactMatchFilter,
+    MetadataFilter,
     MetadataFilters,
     VectorStoreQuery,
     VectorStoreQueryMode,
     BasePydanticVectorStore,
 )
 from llama_index.vector_stores.clickhouse import ClickHouseVectorStore
+from llama_index.vector_stores.clickhouse.base import (
+    escape_str,
+    format_str_list_to_string,
+)
 
 ##
 # Start ClickHouse locally
@@ -466,3 +471,53 @@ def test_table_dropped_when_requested(
 
     # Clean up
     store2.drop()
+
+
+def _meta_filter_sql(filters: MetadataFilters) -> str:
+    from types import SimpleNamespace
+
+    return ClickHouseVectorStore._append_meta_filter_condition(
+        SimpleNamespace(metadata_column="metadata"), None, filters.legacy_filters()
+    )
+
+
+def test_escape_str_rejects_non_str() -> None:
+    assert escape_str("a'b\\c") == "a\\'b\\\\c"
+    with pytest.raises(TypeError):
+        escape_str(["x' OR 1=1 --"])  # type: ignore[arg-type]
+
+
+def test_meta_filter_escapes_str_value() -> None:
+    sql = _meta_filter_sql(
+        MetadataFilters(filters=[ExactMatchFilter(key="a'uthor", value="x' OR 1=1 --")])
+    )
+    assert sql == ("JSONExtractString(metadata, 'a\\'uthor') = 'x\\' OR 1=1 --'")
+
+
+def test_meta_filter_escapes_list_value() -> None:
+    sql = _meta_filter_sql(
+        MetadataFilters(
+            filters=[MetadataFilter(key="author", value=["x' OR 1=1 --", "b\\"])]
+        )
+    )
+    assert sql == (
+        "JSONExtractString(metadata, 'author') IN ('x\\' OR 1=1 --', 'b\\\\')"
+    )
+
+
+def test_meta_filter_numeric_and_empty_list_values() -> None:
+    assert _meta_filter_sql(
+        MetadataFilters(filters=[MetadataFilter(key="year", value=2020)])
+    ) == ("JSONExtractString(metadata, 'year') = '2020'")
+    assert (
+        _meta_filter_sql(
+            MetadataFilters(filters=[MetadataFilter(key="author", value=[])])
+        )
+        == "0"
+    )
+
+
+def test_format_str_list_quotes_and_escapes() -> None:
+    assert format_str_list_to_string(["a", "x'] OR 1=1 --"]) == (
+        "['a','x\\'] OR 1=1 --']"
+    )

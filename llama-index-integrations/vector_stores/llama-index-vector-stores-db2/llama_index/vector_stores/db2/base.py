@@ -114,10 +114,6 @@ column_config: Dict = {
 }
 
 
-def _stringify_list(lst: List) -> str:
-    return "(" + ",".join(f"'{item}'" for item in lst) + ")"
-
-
 def table_exists(connection: Connection, table_name: str) -> bool:
     try:
         cursor = connection.cursor()
@@ -265,12 +261,16 @@ class DB2LlamaVS(BasePydanticVectorStore):
         return "DB2LlamaVS"
 
     def _append_meta_filter_condition(
-        self, where_str: Optional[str], exact_match_filter: list
+        self, where_str: Optional[str], exact_match_filter: list, params: list
     ) -> str:
-        filter_str = " AND ".join(
-            f"JSON_VALUE({self.metadata_column}, '$.{filter_item.key}') = '{filter_item.value}'"
-            for filter_item in exact_match_filter
-        )
+        # Values are bound as parameters; DB2 requires the JSON path to be a
+        # string constant, so the key is embedded with quotes escaped.
+        conditions = []
+        for filter_item in exact_match_filter:
+            key = str(filter_item.key).replace("'", "''")
+            conditions.append(f"JSON_VALUE({self.metadata_column}, '$.{key}') = ?")
+            params.append(str(filter_item.value))
+        filter_str = " AND ".join(conditions)
         if where_str is None:
             where_str = filter_str
         else:
@@ -330,10 +330,10 @@ class DB2LlamaVS(BasePydanticVectorStore):
 
     @_handle_exceptions
     def delete(self, ref_doc_id: str, **kwargs: Any) -> None:
-        ddl = f"DELETE FROM {self.table_name} WHERE doc_id = '{ref_doc_id}'"
+        ddl = f"DELETE FROM {self.table_name} WHERE doc_id = ?"
         cursor = self._client.cursor()
         try:
-            cursor.execute(ddl)
+            cursor.execute(ddl, [ref_doc_id])
             cursor.execute("COMMIT")
         finally:
             cursor.close()
@@ -345,13 +345,15 @@ class DB2LlamaVS(BasePydanticVectorStore):
     @_handle_exceptions
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         distance_function = _get_distance_function(self.distance_strategy)
-        where_str = (
-            f"doc_id in {_stringify_list(query.doc_ids)}" if query.doc_ids else None
-        )
+        where_params: list = []
+        where_str = None
+        if query.doc_ids:
+            where_str = f"doc_id in ({', '.join('?' for _ in query.doc_ids)})"
+            where_params.extend(query.doc_ids)
 
         if query.filters is not None:
             where_str = self._append_meta_filter_condition(
-                where_str, query.filters.filters
+                where_str, query.filters.filters, where_params
             )
 
         # build query sql
@@ -362,7 +364,7 @@ class DB2LlamaVS(BasePydanticVectorStore):
         embedding = f"{query.query_embedding}"
         cursor = self._client.cursor()
         try:
-            cursor.execute(query_sql, [embedding])
+            cursor.execute(query_sql, [embedding, *where_params])
             results = cursor.fetchall()
         finally:
             cursor.close()

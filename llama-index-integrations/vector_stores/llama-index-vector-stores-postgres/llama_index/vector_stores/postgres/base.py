@@ -1,5 +1,7 @@
+import json
 import logging
 import re
+import uuid
 from typing import (
     Any,
     Dict,
@@ -39,7 +41,7 @@ from llama_index.core.vector_stores.utils import (
 
 DEFAULT_MMR_PREFETCH_FACTOR = 4.0
 
-from sqlalchemy import text, select
+from sqlalchemy import bindparam, text, select
 from sqlalchemy.sql.selectable import Select
 
 PGType = Literal[
@@ -688,52 +690,90 @@ class PGVectorStore(BasePydanticVectorStore):
             return "="
 
     def _build_filter_clause(self, filter_: MetadataFilter) -> Any:
-        from sqlalchemy import Float, cast
-        from sqlalchemy.dialects.postgresql import JSONB, TEXT, array
-
-        # Keys and values are passed as bind parameters so that untrusted
-        # filter input can never alter the structure of the SQL statement.
-        metadata_col = self._table_class.metadata_
-        value_as_text = metadata_col[filter_.key].astext
-        jsonb_value = cast(metadata_col, JSONB).op("->", return_type=JSONB)(filter_.key)
+        # Filter keys and values are bound as parameters (never interpolated)
+        # since they may originate from end users or LLM-generated filters.
+        suffix = uuid.uuid4().hex
+        key_param = f"filter_key_{suffix}"
+        value_param = f"filter_value_{suffix}"
         operator = self._to_postgres_operator(filter_.operator)
+        key_bind = bindparam(key_param, str(filter_.key), type_=sqlalchemy.String)
 
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
             # Expects a single value in the metadata, and a list to compare
-            values = [str(e) for e in filter_.value]
-            if filter_.operator == FilterOperator.IN:
-                return value_as_text.in_(values)
-            return value_as_text.not_in(values)
+            return text(
+                f"metadata_->>:{key_param} {operator} :{value_param}"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param,
+                    [str(e) for e in filter_.value],
+                    type_=sqlalchemy.String,
+                    expanding=True,
+                ),
+            )
         elif filter_.operator in [FilterOperator.ANY, FilterOperator.ALL]:
             # Expects a text array stored in the metadata, and a list of values to compare
             # Works with text[] arrays using PostgreSQL ?| (ANY) and ?& (ALL) operators
             # Example: metadata_::jsonb->'tags' ?| array['AI', 'ML']
-            values = array([str(e) for e in filter_.value], type_=TEXT)
-            if filter_.operator == FilterOperator.ANY:
-                return jsonb_value.has_any(values)
-            return jsonb_value.has_all(values)
+            return text(
+                f"metadata_::jsonb->:{key_param} {operator} "
+                f"CAST(:{value_param} AS text[])"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param,
+                    [str(e) for e in filter_.value],
+                    type_=sqlalchemy.ARRAY(sqlalchemy.String),
+                ),
+            )
         elif filter_.operator == FilterOperator.CONTAINS:
             # Expects a list stored in the metadata, and a single value to compare
-            return jsonb_value.contains([str(filter_.value)])
-        elif filter_.operator == FilterOperator.TEXT_MATCH:
+            return text(
+                f"metadata_::jsonb->:{key_param} {operator} "
+                f"CAST(:{value_param} AS jsonb)"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param,
+                    json.dumps([str(filter_.value)]),
+                    type_=sqlalchemy.String,
+                ),
+            )
+        elif (
+            filter_.operator == FilterOperator.TEXT_MATCH
+            or filter_.operator == FilterOperator.TEXT_MATCH_INSENSITIVE
+        ):
             # Where the operator is text_match or ilike, we need to wrap the filter in '%' characters
-            return value_as_text.like(f"%{filter_.value}%")
-        elif filter_.operator == FilterOperator.TEXT_MATCH_INSENSITIVE:
-            return value_as_text.ilike(f"%{filter_.value}%")
+            return text(
+                f"metadata_->>:{key_param} {operator} :{value_param}"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param, f"%{filter_.value}%", type_=sqlalchemy.String
+                ),
+            )
         elif filter_.operator == FilterOperator.IS_EMPTY:
             # Where the operator is is_empty, we need to check if the metadata is null
-            return value_as_text.is_(None)
+            return text(f"metadata_->>:{key_param} {operator}").bindparams(key_bind)
         else:
             # Check if value is a number. If so, cast the metadata value to a float
             # This is necessary because the metadata is stored as a string
             try:
-                return cast(value_as_text, Float).op(operator, is_comparison=True)(
-                    float(filter_.value)
+                return text(
+                    f"(metadata_->>:{key_param})::float {operator} :{value_param}"
+                ).bindparams(
+                    key_bind,
+                    bindparam(
+                        value_param, float(filter_.value), type_=sqlalchemy.Float
+                    ),
                 )
-            except ValueError:
+            except (TypeError, ValueError):
                 # If not a number, then treat it as a string
-                return value_as_text.op(operator, is_comparison=True)(
-                    str(filter_.value)
+                return text(
+                    f"metadata_->>:{key_param} {operator} :{value_param}"
+                ).bindparams(
+                    key_bind,
+                    bindparam(value_param, str(filter_.value), type_=sqlalchemy.String),
                 )
 
     def _recursively_apply_filters(self, filters: List[MetadataFilters]) -> Any:

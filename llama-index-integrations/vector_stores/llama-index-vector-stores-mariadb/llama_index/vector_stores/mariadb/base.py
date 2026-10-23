@@ -331,23 +331,32 @@ class MariaDBVectorStore(BasePydanticVectorStore):
             _logger.warning("Unsupported operator: %s, fallback to '='", operator)
             return "="
 
-    def _build_filter_clause(self, filter_: MetadataFilter) -> str:
-        filter_value = filter_.value
+    def _build_filter_clause(
+        self, filter_: MetadataFilter, params: Dict[str, Any]
+    ) -> str:
+        # Filter keys and values are bound as parameters (never interpolated)
+        # since they may originate from end users or LLM-generated filters.
+        prefix = f"filter_{len(params)}"
+        key_param = f"{prefix}_key"
+        params[key_param] = f"$.{filter_.key}"
+
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
-            values = []
-            for v in filter_.value:
-                if isinstance(v, str):
-                    value = f"'{v}'"
+            value_params = []
+            for i, v in enumerate(filter_.value):
+                value_param = f"{prefix}_value_{i}"
+                params[value_param] = v
+                value_params.append(f":{value_param}")
+            filter_value = f"({', '.join(value_params)})"
+        else:
+            value_param = f"{prefix}_value"
+            params[value_param] = filter_.value
+            filter_value = f":{value_param}"
 
-                values.append(value)
-            filter_value = ", ".join(values)
-            filter_value = f"({filter_value})"
-        elif isinstance(filter_.value, str):
-            filter_value = f"'{filter_.value}'"
+        return f"JSON_VALUE(metadata, :{key_param}) {self._to_mariadb_operator(filter_.operator)} {filter_value}"
 
-        return f"JSON_VALUE(metadata, '$.{filter_.key}') {self._to_mariadb_operator(filter_.operator)} {filter_value}"
-
-    def _filters_to_where_clause(self, filters: MetadataFilters) -> str:
+    def _filters_to_where_clause(
+        self, filters: MetadataFilters, params: Dict[str, Any]
+    ) -> str:
         conditions = {
             FilterCondition.OR: "OR",
             FilterCondition.AND: "AND",
@@ -361,11 +370,11 @@ class MariaDBVectorStore(BasePydanticVectorStore):
         clauses: List[str] = []
         for filter_ in filters.filters:
             if isinstance(filter_, MetadataFilter):
-                clauses.append(self._build_filter_clause(filter_))
+                clauses.append(self._build_filter_clause(filter_, params))
                 continue
 
             if isinstance(filter_, MetadataFilters):
-                subfilters = self._filters_to_where_clause(filter_)
+                subfilters = self._filters_to_where_clause(filter_, params)
                 if subfilters:
                     clauses.append(f"({subfilters})")
                 continue
@@ -411,9 +420,10 @@ class MariaDBVectorStore(BasePydanticVectorStore):
             VEC_DISTANCE_COSINE(embedding, VEC_FromText('{query.query_embedding}')) AS distance
         FROM `{self.table_name}`"""
 
+        params: Dict[str, Any] = {}
         if query.filters:
             stmt += f"""
-        WHERE {self._filters_to_where_clause(query.filters)}"""
+        WHERE {self._filters_to_where_clause(query.filters, params)}"""
 
         stmt += f"""
         ORDER BY distance
@@ -421,7 +431,7 @@ class MariaDBVectorStore(BasePydanticVectorStore):
         """
 
         with self._engine.connect() as connection:
-            result = connection.execute(sqlalchemy.text(stmt))
+            result = connection.execute(sqlalchemy.text(stmt), params)
 
         results = []
         for item in result:

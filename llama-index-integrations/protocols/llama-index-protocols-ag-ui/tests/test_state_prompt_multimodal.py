@@ -150,7 +150,8 @@ def test_injected_state_block_is_dropped_on_reverse_conversion() -> None:
                         ),
                     ),
                 ],
-            )
+            ),
+            allowed_url_hosts={"example.com"},
         )
     ]
     _apply_state_prompt(history, {"a": 1})

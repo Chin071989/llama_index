@@ -16,7 +16,8 @@ This integration requires `ag-ui-protocol>=1.0.0,<2` and
 
 User messages accept strings or AG-UI `ContentPart` arrays. Use `TextPart`,
 `ImagePart`, `AudioPart`, `VideoPart`, and `DocumentPart` with `DataSource` or
-`UrlSource` for media. The deprecated `BinaryInputContent` converter has been
+`UrlSource` for media. `UrlSource` parts are rejected unless their host is
+listed in `allowed_media_url_hosts` (see below). The deprecated `BinaryInputContent` converter has been
 removed. Before sending older persisted messages to this endpoint, migrate each
 `type: "binary"` part to its media type (`image`, `audio`, `video`, or `document`)
 and move its `url` or base64 `data` into a `source`, for example:
@@ -55,6 +56,9 @@ The router is configured with the following parameters:
 - `backend_tools`: Tools that are available to execute on the backend.
 - `system_prompt`: The system prompt to use for the agent.
 - `initial_state`: The initial state to use for the agent. Typically the state is then interacted with by the frontend.
+- `allowed_media_url_hosts`: Hostnames that client-supplied media `UrlSource` parts may point at. Defaults to `None`, which skips every URL source (use `DataSource` instead). Only `https` URLs whose host exactly matches an entry are accepted, because LLM integrations may fetch these URLs from the server.
+
+Errors raised while running the agent are logged server-side; clients receive a generic `RUN_ERROR` event with code `INTERNAL_ERROR`.
 
 ```python
 import uvicorn

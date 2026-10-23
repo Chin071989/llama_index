@@ -913,9 +913,8 @@ def test_image_block_resolve_image_path(
 
 
 def test_image_block_resolve_image_url(png_1px_b64: bytes, png_1px: bytes):
-    with mock.patch("llama_index.core.utils.requests") as mocked_req:
+    with mock.patch("llama_index.core.utils.fetch_url_bytes", return_value=png_1px):
         url_str = "http://example.com"
-        mocked_req.get.return_value = mock.MagicMock(content=png_1px)
         b = ImageBlock(url=AnyUrl(url=url_str))
         img = b.resolve_image()
         assert isinstance(img, BytesIO)
@@ -1139,9 +1138,8 @@ def test_video_block_resolve_video_path(
 
 
 def test_video_block_resolve_video_url(mp4_bytes: bytes, mp4_base64: bytes):
-    with mock.patch("llama_index.core.utils.requests") as mocked_req:
+    with mock.patch("llama_index.core.utils.fetch_url_bytes", return_value=mp4_bytes):
         url_str = "http://example.com/video.mp4"
-        mocked_req.get.return_value = mock.MagicMock(content=mp4_bytes)
         b = VideoBlock(url=AnyUrl(url=url_str))
         vid = b.resolve_video()
         assert isinstance(vid, BytesIO)

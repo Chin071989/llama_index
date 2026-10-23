@@ -1,5 +1,7 @@
 import base64
 
+import pytest
+
 from ag_ui.core import UserMessage
 from ag_ui.core.types import (
     AudioPart,
@@ -27,6 +29,9 @@ from llama_index.protocols.ag_ui.utils import (
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n fake image payload"
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
+
+
+ALLOWED_HOSTS = {"example.com"}
 
 
 def user_message(content) -> UserMessage:
@@ -71,7 +76,8 @@ def test_image_url_part_becomes_image_block_with_url() -> None:
                     source=UrlSource(type="url", value="https://example.com/cat.png"),
                 )
             ]
-        )
+        ),
+        allowed_url_hosts=ALLOWED_HOSTS,
     )
     assert [type(b) for b in msg.blocks] == [ImageBlock]
     assert str(msg.blocks[0].url) == "https://example.com/cat.png"
@@ -104,7 +110,8 @@ def test_audio_video_and_document_parts_convert() -> None:
                     ),
                 ),
             ]
-        )
+        ),
+        allowed_url_hosts=ALLOWED_HOSTS,
     )
     assert [type(b) for b in msg.blocks] == [AudioBlock, VideoBlock, DocumentBlock]
     # MIME carries through: audio/mpeg maps onto the block's format field, and
@@ -274,3 +281,44 @@ def test_mime_types_are_case_insensitive() -> None:
     )
     assert [type(b) for b in blocks] == [AudioBlock]
     assert blocks[0].format == "mp3"
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed"),
+    [
+        ("https://example.com/cat.png", None),
+        ("http://169.254.169.254/latest/meta-data/", None),
+        ("http://169.254.169.254/latest/meta-data/", {"169.254.169.254"}),
+        ("http://example.com/cat.png", ALLOWED_HOSTS),
+        ("https://evil.example.org/cat.png", ALLOWED_HOSTS),
+        ("https://example.com.evil.org/cat.png", ALLOWED_HOSTS),
+        ("file:///etc/passwd", ALLOWED_HOSTS),
+        ("data:image/png;base64,AAAA", ALLOWED_HOSTS),
+    ],
+)
+@pytest.mark.parametrize("part_cls", [ImagePart, AudioPart, VideoPart, DocumentPart])
+def test_url_sources_rejected_unless_allowlisted_https(
+    part_cls, url, allowed, caplog
+) -> None:
+    part = part_cls(
+        type=part_cls.model_fields["type"].default,
+        source=UrlSource(type="url", value=url),
+    )
+    blocks = agui_content_to_blocks(
+        [TextPart(type="text", text="hi"), part], allowed_url_hosts=allowed
+    )
+    assert [type(b) for b in blocks] == [TextBlock]
+    assert "not allowlisted" in caplog.text
+
+
+def test_allowlisted_host_match_is_case_insensitive() -> None:
+    blocks = agui_content_to_blocks(
+        [
+            ImagePart(
+                type="image",
+                source=UrlSource(type="url", value="https://EXAMPLE.com/cat.png"),
+            )
+        ],
+        allowed_url_hosts={"Example.COM"},
+    )
+    assert [type(b) for b in blocks] == [ImageBlock]

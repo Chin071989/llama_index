@@ -23,6 +23,26 @@ class NeptuneQueryException(Exception):
         return self.details
 
 
+def quote_identifier(name: Any) -> str:
+    """
+    Return ``name`` as a backtick-quoted openCypher identifier.
+
+    Neptune openCypher does not support parameterized labels, relationship
+    types or property keys, so they must be interpolated into the query text.
+    Backticks and backslashes are removed so the value cannot terminate the
+    quoted identifier (directly or via an escape sequence) and inject
+    additional openCypher.
+
+    Raises:
+        ValueError: If the identifier is empty after sanitization.
+
+    """
+    sanitized = str(name).replace("`", "").replace("\\", "")
+    if not sanitized.strip():
+        raise ValueError(f"Invalid openCypher identifier: {name!r}")
+    return f"`{sanitized}`"
+
+
 def remove_empty_values(input_dict: Dict) -> Dict:
     """
     Remove entries with empty values from the dictionary.
@@ -233,7 +253,7 @@ def refresh_schema(query: str, summary: Dict) -> None:
 def _get_triples(query: str, e_labels: List[str]) -> List[str]:
     """Get the node-edge->node triple combinations."""
     triple_query = """
-        MATCH (a)-[e:`{e_label}`]->(b)
+        MATCH (a)-[e:{e_label}]->(b)
         WITH a,e,b LIMIT 3000
         RETURN DISTINCT labels(a) AS from, type(e) AS edge, labels(b) AS to
         LIMIT 10
@@ -242,7 +262,7 @@ def _get_triples(query: str, e_labels: List[str]) -> List[str]:
     triple_template = "(:`{a}`)-[:`{e}`]->(:`{b}`)"
     triple_schema = []
     for label in e_labels:
-        q = triple_query.format(e_label=label)
+        q = triple_query.format(e_label=quote_identifier(label))
         data = query(q)
         for d in data:
             triple = triple_template.format(a=d["from"][0], e=d["edge"], b=d["to"][0])
@@ -254,13 +274,13 @@ def _get_triples(query: str, e_labels: List[str]) -> List[str]:
 def _get_node_properties(query: str, n_labels: List[str], types: Dict) -> List:
     """Get the node properties for the label."""
     node_properties_query = """
-        MATCH (a:`{n_label}`)
+        MATCH (a:{n_label})
         RETURN properties(a) AS props
         LIMIT 100
         """
     node_properties = []
     for label in n_labels:
-        q = node_properties_query.format(n_label=label)
+        q = node_properties_query.format(n_label=quote_identifier(label))
         data = {"label": label, "properties": query(q)}
         s = set({})
         for p in data["properties"]:
@@ -290,13 +310,13 @@ def _get_edge_properties(
 ) -> List:
     """Get the edge properties for the label."""
     edge_properties_query = """
-        MATCH ()-[e:`{e_label}`]->()
+        MATCH ()-[e:{e_label}]->()
         RETURN properties(e) AS props
         LIMIT 100
         """
     edge_properties = []
     for label in e_labels:
-        q = edge_properties_query.format(e_label=label)
+        q = edge_properties_query.format(e_label=quote_identifier(label))
         data = {"label": label, "properties": query(q)}
         s = set({})
         for p in data["properties"]:

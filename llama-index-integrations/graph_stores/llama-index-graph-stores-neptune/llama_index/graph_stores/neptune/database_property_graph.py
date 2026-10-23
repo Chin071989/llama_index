@@ -2,7 +2,11 @@ import json
 import logging
 
 from typing import Any, Dict, Tuple, List, Optional
-from .neptune import NeptuneQueryException, create_neptune_database_client
+from .neptune import (
+    NeptuneQueryException,
+    create_neptune_database_client,
+    quote_identifier,
+)
 from .base_property_graph import (
     NeptuneBasePropertyGraph,
     BASE_ENTITY_LABEL,
@@ -140,7 +144,7 @@ class NeptuneDatabasePropertyGraphStore(NeptuneBasePropertyGraph):
                     MERGE (e:`{BASE_NODE_LABEL}` {{id: row.id}})
                     SET e += removeKeyFromMap(row.properties, '')
                     SET e.name = row.name, e:`{BASE_ENTITY_LABEL}`
-                    SET e:`{d["label"]}`
+                    SET e:{quote_identifier(d["label"])}
                     WITH e, row
                     WHERE removeKeyFromMap(row.properties, '').triplet_source_id IS NOT NULL
                     MERGE (c:Chunk {{id: removeKeyFromMap(row.properties, '').triplet_source_id}})

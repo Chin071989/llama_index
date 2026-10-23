@@ -12,7 +12,7 @@ from llama_index.core.graph_stores.types import (
     Triplet,
 )
 from llama_index.core.vector_stores.types import VectorStoreQuery
-from .neptune import remove_empty_values, refresh_schema
+from .neptune import remove_empty_values, refresh_schema, quote_identifier
 
 logger = logging.getLogger(__name__)
 BASE_ENTITY_LABEL = "__Entity__"
@@ -63,7 +63,7 @@ class NeptuneBasePropertyGraph(PropertyGraphStore):
         if properties:
             prop_list = []
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{quote_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher_statement += " AND ".join(prop_list)
 
@@ -142,13 +142,18 @@ class NeptuneBasePropertyGraph(PropertyGraphStore):
         if properties:
             prop_list = []
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{quote_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher_statement += " AND ".join(prop_list)
 
+        rel_filter = (
+            ":" + "|".join(quote_identifier(rel) for rel in relation_names)
+            if relation_names
+            else ""
+        )
         return_statement = f"""
             WITH e
-            MATCH (e)-[r{":`" + "`|`".join(relation_names) + "`" if relation_names else ""}]->(t:{BASE_ENTITY_LABEL})
+            MATCH (e)-[r{rel_filter}]->(t:{BASE_ENTITY_LABEL})
             RETURN e.name AS source_id, [l in labels(e) WHERE l <> '{BASE_ENTITY_LABEL}' | l][0] AS source_type,
                    e{{.* , embedding: Null, name: Null}} AS source_properties,
                    type(r) AS type,
@@ -281,9 +286,9 @@ class NeptuneBasePropertyGraph(PropertyGraphStore):
                 ON CREATE SET source:Chunk
                 MERGE (target {id: row.target_id})
                 ON CREATE SET target:Chunk
-                MERGE (source)-[r:`"""
-                + r.label
-                + """`]->(target)
+                MERGE (source)-[r:"""
+                + quote_identifier(r.label)
+                + """]->(target)
                 SET r+= removeKeyFromMap(row.properties, '')
                 RETURN count(*)
                 """,
@@ -321,14 +326,16 @@ class NeptuneBasePropertyGraph(PropertyGraphStore):
 
         if relation_names:
             for rel in relation_names:
-                self.structured_query(f"MATCH ()-[r:`{rel}`]->() DELETE r")
+                self.structured_query(
+                    f"MATCH ()-[r:{quote_identifier(rel)}]->() DELETE r"
+                )
 
         if properties:
             cypher = "MATCH (e) WHERE "
             prop_list = []
             params = {}
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{quote_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher += " AND ".join(prop_list)
             self.structured_query(cypher + " DETACH DELETE e", param_map=params)

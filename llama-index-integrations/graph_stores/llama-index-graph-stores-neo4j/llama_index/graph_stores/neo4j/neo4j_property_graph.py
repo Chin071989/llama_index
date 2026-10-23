@@ -37,6 +37,18 @@ def remove_empty_values(input_dict):
     return {key: value for key, value in input_dict.items() if value}
 
 
+def escape_cypher_identifier(name: Any) -> str:
+    """
+    Quote a label, relationship type or property key for safe use in Cypher.
+
+    Backticks are doubled so the value cannot terminate the quoted identifier.
+    Unicode-escaped backticks are normalized first, since some Neo4j versions
+    resolve them before tokenizing identifiers.
+    """
+    name = str(name).replace("\\u0060", "`").replace("\\U00000060", "`")
+    return "`" + name.replace("`", "``") + "`"
+
+
 BASE_ENTITY_LABEL = "__Entity__"
 BASE_NODE_LABEL = "__Node__"
 EXCLUDED_LABELS = ["_Bloom_Perspective_", "_Bloom_Scene_"]
@@ -299,10 +311,12 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
             node_props = self.structured_schema["node_props"].get(node["name"])
             if not node_props:  # The node has no properties
                 continue
-            enhanced_cypher = self._enhanced_schema_cypher(
+            enhanced_cypher, enhanced_params = self._enhanced_schema_cypher(
                 node["name"], node_props, node["count"] < EXHAUSTIVE_SEARCH_LIMIT
             )
-            enhanced_info = self.structured_query(enhanced_cypher)[0]["output"]
+            enhanced_info = self.structured_query(
+                enhanced_cypher, param_map=enhanced_params
+            )[0]["output"]
             for prop in node_props:
                 # Map to custom types
                 # Text
@@ -327,14 +341,16 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
             rel_props = self.structured_schema["rel_props"].get(rel["name"])
             if not rel_props:  # The rel has no properties
                 continue
-            enhanced_cypher = self._enhanced_schema_cypher(
+            enhanced_cypher, enhanced_params = self._enhanced_schema_cypher(
                 rel["name"],
                 rel_props,
                 rel["count"] < EXHAUSTIVE_SEARCH_LIMIT,
                 is_relationship=True,
             )
             try:
-                enhanced_info = self.structured_query(enhanced_cypher)[0]["output"]
+                enhanced_info = self.structured_query(
+                    enhanced_cypher, param_map=enhanced_params
+                )[0]["output"]
                 for prop in rel_props:
                     if prop["property"] in enhanced_info:
                         prop.update(enhanced_info[prop["property"]])
@@ -404,6 +420,13 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
 
     def upsert_relations(self, relations: List[Relation]) -> None:
         """Add relations."""
+        for r in relations:
+            # apoc.merge.relationship interpolates the type into Cypher unescaped
+            if "`" in escape_cypher_identifier(r.label)[1:-1]:
+                raise ValueError(
+                    f"Relation label {r.label!r} contains a backtick, which is not "
+                    "allowed in Neo4j relationship types."
+                )
         params = [r.dict() for r in relations]
         for index in range(0, len(params), CHUNK_SIZE):
             chunked_params = params[index : index + CHUNK_SIZE]
@@ -440,7 +463,7 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
         if properties:
             prop_list = []
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{escape_cypher_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher_statement += " AND " + " AND ".join(prop_list)
 
@@ -504,15 +527,20 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
         if properties:
             prop_list = []
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{escape_cypher_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher_statement += " AND ".join(prop_list)
 
+        rel_filter = (
+            ":" + "|".join(escape_cypher_identifier(r) for r in relation_names)
+            if relation_names
+            else ""
+        )
         return_statement = f"""
         WITH e
         CALL (e) {{
             WITH e
-            MATCH (e)-[r{":`" + "`|`".join(relation_names) + "`" if relation_names else ""}]->(t:`{BASE_ENTITY_LABEL}`)
+            MATCH (e)-[r{rel_filter}]->(t:`{BASE_ENTITY_LABEL}`)
             RETURN e.name AS source_id, [l in labels(e) WHERE NOT l IN ['{BASE_ENTITY_LABEL}', '{BASE_NODE_LABEL}'] | l][0] AS source_type,
                    e{{.* , embedding: Null, name: Null}} AS source_properties,
                    type(r) AS type,
@@ -521,7 +549,7 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
                    t{{.* , embedding: Null, name: Null}} AS target_properties
             UNION ALL
             WITH e
-            MATCH (e)<-[r{":`" + "`|`".join(relation_names) + "`" if relation_names else ""}]-(t:`{BASE_ENTITY_LABEL}`)
+            MATCH (e)<-[r{rel_filter}]-(t:`{BASE_ENTITY_LABEL}`)
             RETURN t.name AS source_id, [l in labels(t) WHERE NOT l IN ['{BASE_ENTITY_LABEL}', '{BASE_NODE_LABEL}'] | l][0] AS source_type,
                    t{{.* , embedding: Null, name: Null}} AS source_properties,
                    type(r) AS type,
@@ -681,7 +709,7 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
         if query.filters:
             for index, filter in enumerate(query.filters.filters):
                 conditions.append(
-                    f"{'NOT' if filter.operator.value in ['nin'] else ''} e.`{filter.key}` "
+                    f"{'NOT' if filter.operator.value in ['nin'] else ''} e.{escape_cypher_identifier(filter.key)} "
                     f"{convert_operator(filter.operator.value)} $param_{index}"
                 )
                 filter_params[f"param_{index}"] = filter.value
@@ -757,14 +785,16 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
 
         if relation_names:
             for rel in relation_names:
-                self.structured_query(f"MATCH ()-[r:`{rel}`]->() DELETE r")
+                self.structured_query(
+                    f"MATCH ()-[r:{escape_cypher_identifier(rel)}]->() DELETE r"
+                )
 
         if properties:
             cypher = "MATCH (e) WHERE "
             prop_list = []
             params = {}
             for i, prop in enumerate(properties):
-                prop_list.append(f"e.`{prop}` = $property_{i}")
+                prop_list.append(f"e.{escape_cypher_identifier(prop)} = $property_{i}")
                 params[f"property_{i}"] = properties[prop]
             cypher += " AND ".join(prop_list)
             self.structured_query(cypher + " DETACH DELETE e", param_map=params)
@@ -775,11 +805,14 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
         properties: List[Dict[str, Any]],
         exhaustive: bool,
         is_relationship: bool = False,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
+        q = escape_cypher_identifier
         if is_relationship:
-            match_clause = f"MATCH ()-[n:`{label_or_type}`]->()"
+            match_clause = f"MATCH ()-[n:{q(label_or_type)}]->()"
         else:
-            match_clause = f"MATCH (n:`{label_or_type}`)"
+            match_clause = f"MATCH (n:{q(label_or_type)})"
+
+        params: Dict[str, Any] = {}
 
         with_clauses = []
         return_clauses = []
@@ -790,12 +823,12 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
                 prop_type = prop["type"]
                 if prop_type == "STRING":
                     with_clauses.append(
-                        f"collect(distinct substring(toString(coalesce(n.`{prop_name}`, '')), 0, {LONG_TEXT_THRESHOLD})) "
-                        f"AS `{prop_name}_values`"
+                        f"collect(distinct substring(toString(coalesce(n.{q(prop_name)}, '')), 0, {LONG_TEXT_THRESHOLD})) "
+                        f"AS {q(prop_name + '_values')}"
                     )
                     return_clauses.append(
-                        f"values:`{prop_name}_values`[..{DISTINCT_VALUE_LIMIT}],"
-                        f" distinct_count: size(`{prop_name}_values`)"
+                        f"values:{q(prop_name + '_values')}[..{DISTINCT_VALUE_LIMIT}],"
+                        f" distinct_count: size({q(prop_name + '_values')})"
                     )
                 elif prop_type in [
                     "INTEGER",
@@ -804,27 +837,31 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
                     "DATE_TIME",
                     "LOCAL_DATE_TIME",
                 ]:
-                    with_clauses.append(f"min(n.`{prop_name}`) AS `{prop_name}_min`")
-                    with_clauses.append(f"max(n.`{prop_name}`) AS `{prop_name}_max`")
                     with_clauses.append(
-                        f"count(distinct n.`{prop_name}`) AS `{prop_name}_distinct`"
+                        f"min(n.{q(prop_name)}) AS {q(prop_name + '_min')}"
+                    )
+                    with_clauses.append(
+                        f"max(n.{q(prop_name)}) AS {q(prop_name + '_max')}"
+                    )
+                    with_clauses.append(
+                        f"count(distinct n.{q(prop_name)}) AS {q(prop_name + '_distinct')}"
                     )
                     return_clauses.append(
-                        f"min: toString(`{prop_name}_min`), "
-                        f"max: toString(`{prop_name}_max`), "
-                        f"distinct_count: `{prop_name}_distinct`"
+                        f"min: toString({q(prop_name + '_min')}), "
+                        f"max: toString({q(prop_name + '_max')}), "
+                        f"distinct_count: {q(prop_name + '_distinct')}"
                     )
                 elif prop_type == "LIST":
                     with_clauses.append(
-                        f"min(size(coalesce(n.`{prop_name}`, []))) AS `{prop_name}_size_min`, "
-                        f"max(size(coalesce(n.`{prop_name}`, []))) AS `{prop_name}_size_max`, "
+                        f"min(size(coalesce(n.{q(prop_name)}, []))) AS {q(prop_name + '_size_min')}, "
+                        f"max(size(coalesce(n.{q(prop_name)}, []))) AS {q(prop_name + '_size_max')}, "
                         # Get first 3 sub-elements of the first element as sample values
-                        f"collect(n.`{prop_name}`)[0][..3] AS `{prop_name}_values`"
+                        f"collect(n.{q(prop_name)})[0][..3] AS {q(prop_name + '_values')}"
                     )
                     return_clauses.append(
-                        f"min_size: `{prop_name}_size_min`, "
-                        f"max_size: `{prop_name}_size_max`, "
-                        f"values:`{prop_name}_values`"
+                        f"min_size: {q(prop_name + '_size_min')}, "
+                        f"max_size: {q(prop_name + '_size_max')}, "
+                        f"values:{q(prop_name + '_values')}"
                     )
                 elif prop_type in ["BOOLEAN", "POINT", "DURATION"]:
                     continue
@@ -850,20 +887,23 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
                         and prop_index[0].get("size") > 0
                         and prop_index[0].get("distinctValues") <= DISTINCT_VALUE_LIMIT
                     ):
-                        distinct_values = self.query(
-                            f"CALL apoc.schema.properties.distinct("
-                            f"'{label_or_type}', '{prop_name}') YIELD value"
+                        distinct_values = self.structured_query(
+                            "CALL apoc.schema.properties.distinct("
+                            "$label, $prop) YIELD value",
+                            param_map={"label": label_or_type, "prop": prop_name},
                         )[0]["value"]
+                        param_name = f"distinct_values_{len(params)}"
+                        params[param_name] = distinct_values
                         return_clauses.append(
-                            f"values: {distinct_values},"
+                            f"values: ${param_name},"
                             f" distinct_count: {len(distinct_values)}"
                         )
                     else:
                         with_clauses.append(
-                            f"collect(distinct substring(toString(n.`{prop_name}`), 0, {LONG_TEXT_THRESHOLD})) "
-                            f"AS `{prop_name}_values`"
+                            f"collect(distinct substring(toString(n.{q(prop_name)}), 0, {LONG_TEXT_THRESHOLD})) "
+                            f"AS {q(prop_name + '_values')}"
                         )
-                        return_clauses.append(f"values: `{prop_name}_values`")
+                        return_clauses.append(f"values: {q(prop_name + '_values')}")
                 elif prop_type in [
                     "INTEGER",
                     "FLOAT",
@@ -873,37 +913,37 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
                 ]:
                     if not prop_index:
                         with_clauses.append(
-                            f"collect(distinct toString(coalesce(n.`{prop_name}`, ''))) "
-                            f"AS `{prop_name}_values`"
+                            f"collect(distinct toString(coalesce(n.{q(prop_name)}, ''))) "
+                            f"AS {q(prop_name + '_values')}"
                         )
-                        return_clauses.append(f"values: `{prop_name}_values`")
+                        return_clauses.append(f"values: {q(prop_name + '_values')}")
                     else:
                         with_clauses.append(
-                            f"min(n.`{prop_name}`) AS `{prop_name}_min`"
+                            f"min(n.{q(prop_name)}) AS {q(prop_name + '_min')}"
                         )
                         with_clauses.append(
-                            f"max(n.`{prop_name}`) AS `{prop_name}_max`"
+                            f"max(n.{q(prop_name)}) AS {q(prop_name + '_max')}"
                         )
                         with_clauses.append(
-                            f"count(distinct n.`{prop_name}`) AS `{prop_name}_distinct`"
+                            f"count(distinct n.{q(prop_name)}) AS {q(prop_name + '_distinct')}"
                         )
                         return_clauses.append(
-                            f"min: toString(`{prop_name}_min`), "
-                            f"max: toString(`{prop_name}_max`), "
-                            f"distinct_count: `{prop_name}_distinct`"
+                            f"min: toString({q(prop_name + '_min')}), "
+                            f"max: toString({q(prop_name + '_max')}), "
+                            f"distinct_count: {q(prop_name + '_distinct')}"
                         )
 
                 elif prop_type == "LIST":
                     with_clauses.append(
-                        f"min(size(coalesce(n.`{prop_name}`, []))) AS `{prop_name}_size_min`, "
-                        f"max(size(coalesce(n.`{prop_name}`, []))) AS `{prop_name}_size_max`, "
+                        f"min(size(coalesce(n.{q(prop_name)}, []))) AS {q(prop_name + '_size_min')}, "
+                        f"max(size(coalesce(n.{q(prop_name)}, []))) AS {q(prop_name + '_size_max')}, "
                         # Get first 3 sub-elements of the first element as sample values
-                        f"collect(n.`{prop_name}`)[0][..3] AS `{prop_name}_values`"
+                        f"collect(n.{q(prop_name)})[0][..3] AS {q(prop_name + '_values')}"
                     )
                     return_clauses.append(
-                        f"min_size: `{prop_name}_size_min`, "
-                        f"max_size: `{prop_name}_size_max`, "
-                        f"values:`{prop_name}_values`"
+                        f"min_size: {q(prop_name + '_size_min')}, "
+                        f"max_size: {q(prop_name + '_size_max')}, "
+                        f"values:{q(prop_name + '_values')}"
                     )
                 elif prop_type in ["BOOLEAN", "POINT", "DURATION"]:
                     continue
@@ -913,12 +953,12 @@ class Neo4jPropertyGraphStore(PropertyGraphStore):
         with_clause = "WITH " + ",\n     ".join(with_clauses)
         return_clause = (
             "RETURN {"
-            + ", ".join(f"`{k}`: {v}" for k, v in output_dict.items())
+            + ", ".join(f"{q(k)}: {v}" for k, v in output_dict.items())
             + "} AS output"
         )
 
         # Combine all parts of the Cypher query
-        return f"{match_clause}\n{with_clause}\n{return_clause}"
+        return f"{match_clause}\n{with_clause}\n{return_clause}", params
 
     def get_schema(self, refresh: bool = False) -> Any:
         if refresh:

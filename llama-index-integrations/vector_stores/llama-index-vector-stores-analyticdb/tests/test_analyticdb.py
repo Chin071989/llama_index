@@ -60,3 +60,73 @@ def test_adbvector_delete() -> None:
     vector_store.delete(ref_doc_id="31d00b73-41ca-4d5a-a5b4-85a014b2c924")
 
     assert client.delete_collection_data.call_count == 1
+
+
+def test_build_filter_clause_escapes_values() -> None:
+    from llama_index.core.vector_stores.types import (
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
+    )
+    from llama_index.vector_stores.analyticdb.base import (
+        _build_filter_clause,
+        _recursively_parse_adb_filter,
+    )
+
+    payload = "x' OR '1'='1"
+    assert (
+        _build_filter_clause(MetadataFilter(key="tenant", value=payload))
+        == "metadata_->>E'tenant' = E'x'' OR ''1''=''1'"
+    )
+    assert (
+        _build_filter_clause(MetadataFilter(key="n", value=5, operator=">"))
+        == "metadata_->>E'n' > E'5'"
+    )
+    assert (
+        _build_filter_clause(
+            MetadataFilter(key="k", value=["a", "b'\"\\"], operator=FilterOperator.IN)
+        )
+        == "metadata_->>E'k' IN (E'a', E'b''\"\\\\')"
+    )
+    assert (
+        _build_filter_clause(
+            MetadataFilter(key="tags", value=payload, operator=FilterOperator.CONTAINS)
+        )
+        == "metadata_::jsonb->E'tags' @> E'[\"x'' OR ''1''=''1\"]'::jsonb"
+    )
+    assert (
+        _recursively_parse_adb_filter(
+            MetadataFilters(
+                filters=[
+                    MetadataFilter(key="a", value="1"),
+                    MetadataFilter(key="b", value="2"),
+                ]
+            )
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("key", ["a' OR '1'='1", "a b", "a;--", "a\\b", ""])
+def test_build_filter_clause_rejects_bad_keys(key: str) -> None:
+    from llama_index.core.vector_stores.types import MetadataFilter
+    from llama_index.vector_stores.analyticdb.base import _build_filter_clause
+
+    with pytest.raises(ValueError):
+        _build_filter_clause(MetadataFilter(key=key, value="v"))
+
+
+def test_build_filter_clause_rejects_bad_values() -> None:
+    from llama_index.core.vector_stores.types import FilterOperator, MetadataFilter
+    from llama_index.vector_stores.analyticdb.base import _build_filter_clause
+
+    with pytest.raises(ValueError):
+        _build_filter_clause(MetadataFilter(key="k", value="a\x00b"))
+    with pytest.raises(ValueError):
+        _build_filter_clause(
+            MetadataFilter(key="k", value=[], operator=FilterOperator.IN)
+        )
+    with pytest.raises(ValueError):
+        _build_filter_clause(
+            MetadataFilter(key="k", value="a", operator=FilterOperator.NIN)
+        )

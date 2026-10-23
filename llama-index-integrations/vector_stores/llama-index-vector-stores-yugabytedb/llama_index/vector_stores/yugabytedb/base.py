@@ -1,5 +1,7 @@
+import json
 import logging
 import re
+import uuid
 from typing import (
     Any,
     Dict,
@@ -627,26 +629,41 @@ class YBVectorStore(BasePydanticVectorStore):
             return "="
 
     def _build_filter_clause(self, filter_: MetadataFilter) -> Any:
-        from sqlalchemy import text
+        # Filter keys and values are bound as parameters (never interpolated)
+        # since they may originate from end users or LLM-generated filters.
+        from sqlalchemy import bindparam, text
+
+        suffix = uuid.uuid4().hex
+        key_param = f"filter_key_{suffix}"
+        value_param = f"filter_value_{suffix}"
+        operator = self._to_postgres_operator(filter_.operator)
+        key_bind = bindparam(key_param, str(filter_.key), type_=sqlalchemy.String)
 
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
             # Expects a single value in the metadata, and a list to compare
-
-            # In Python, to create a tuple with a single element, you need to include a comma after the element
-            # This code will correctly format the IN clause whether there is one element or multiple elements in the list:
-            filter_value = ", ".join(f"'{e}'" for e in filter_.value)
-
             return text(
-                f"metadata_->>'{filter_.key}' "
-                f"{self._to_postgres_operator(filter_.operator)} "
-                f"({filter_value})"
+                f"metadata_->>:{key_param} {operator} :{value_param}"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param,
+                    [str(e) for e in filter_.value],
+                    type_=sqlalchemy.String,
+                    expanding=True,
+                ),
             )
         elif filter_.operator == FilterOperator.CONTAINS:
             # Expects a list stored in the metadata, and a single value to compare
             return text(
-                f"metadata_::jsonb->'{filter_.key}' "
-                f"{self._to_postgres_operator(filter_.operator)} "
-                f"'[\"{filter_.value}\"]'"
+                f"metadata_::jsonb->:{key_param} {operator} "
+                f"CAST(:{value_param} AS jsonb)"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param,
+                    json.dumps([str(filter_.value)]),
+                    type_=sqlalchemy.String,
+                ),
             )
         elif (
             filter_.operator == FilterOperator.TEXT_MATCH
@@ -654,31 +671,35 @@ class YBVectorStore(BasePydanticVectorStore):
         ):
             # Where the operator is text_match or ilike, we need to wrap the filter in '%' characters
             return text(
-                f"metadata_->>'{filter_.key}' "
-                f"{self._to_postgres_operator(filter_.operator)} "
-                f"'%{filter_.value}%'"
+                f"metadata_->>:{key_param} {operator} :{value_param}"
+            ).bindparams(
+                key_bind,
+                bindparam(
+                    value_param, f"%{filter_.value}%", type_=sqlalchemy.String
+                ),
             )
         elif filter_.operator == FilterOperator.IS_EMPTY:
             # Where the operator is is_empty, we need to check if the metadata is null
-            return text(
-                f"metadata_->>'{filter_.key}' "
-                f"{self._to_postgres_operator(filter_.operator)}"
-            )
+            return text(f"metadata_->>:{key_param} {operator}").bindparams(key_bind)
         else:
             # Check if value is a number. If so, cast the metadata value to a float
             # This is necessary because the metadata is stored as a string
             try:
                 return text(
-                    f"(metadata_->>'{filter_.key}')::float "
-                    f"{self._to_postgres_operator(filter_.operator)} "
-                    f"{float(filter_.value)}"
+                    f"(metadata_->>:{key_param})::float {operator} :{value_param}"
+                ).bindparams(
+                    key_bind,
+                    bindparam(
+                        value_param, float(filter_.value), type_=sqlalchemy.Float
+                    ),
                 )
-            except ValueError:
+            except (TypeError, ValueError):
                 # If not a number, then treat it as a string
                 return text(
-                    f"metadata_->>'{filter_.key}' "
-                    f"{self._to_postgres_operator(filter_.operator)} "
-                    f"'{filter_.value}'"
+                    f"metadata_->>:{key_param} {operator} :{value_param}"
+                ).bindparams(
+                    key_bind,
+                    bindparam(value_param, str(filter_.value), type_=sqlalchemy.String),
                 )
 
     def _recursively_apply_filters(self, filters: List[MetadataFilters]) -> Any:

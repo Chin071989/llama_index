@@ -2,6 +2,7 @@
 
 import logging
 import json
+import re
 from typing import Any, List, Union
 
 from llama_index.core.bridge.pydantic import PrivateAttr
@@ -40,16 +41,60 @@ OPERATOR_MAP = {
 }
 
 
+_FILTER_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_\-.]+$")
+
+
+def _validate_filter_key(key: str) -> str:
+    if not isinstance(key, str) or not _FILTER_KEY_PATTERN.fullmatch(key):
+        raise ValueError(
+            f"Invalid metadata filter key {key!r}: only letters, digits, "
+            "'_', '-' and '.' are allowed."
+        )
+    return key
+
+
+def _to_sql_literal(value: Any) -> str:
+    """Render a value as an escaped SQL string literal."""
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        text = repr(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise ValueError(
+            f"Unsupported metadata filter value type: {type(value).__name__}"
+        )
+    if "\x00" in text:
+        raise ValueError("Metadata filter values must not contain NUL characters.")
+    # E'' syntax makes backslash handling independent of standard_conforming_strings.
+    escaped = text.replace("\\", "\\\\").replace("'", "''")
+    return f"E'{escaped}'"
+
+
 def _build_filter_clause(filter_: MetadataFilter) -> str:
     adb_operator = OPERATOR_MAP.get(filter_.operator)
+    if adb_operator is None:
+        raise ValueError(f"Unsupported filter operator: {filter_.operator}")
+    key = _to_sql_literal(_validate_filter_key(filter_.key))
     if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
-        return f"metadata_->>'{filter_.key}' {adb_operator} {tuple(filter_.value)}"
+        if not isinstance(filter_.value, list) or not filter_.value:
+            raise ValueError(
+                f"Filter operator {filter_.operator} requires a non-empty list value."
+            )
+        values = ", ".join(_to_sql_literal(v) for v in filter_.value)
+        return f"metadata_->>{key} {adb_operator} ({values})"
     elif filter_.operator == FilterOperator.CONTAINS:
-        return (
-            f"metadata_::jsonb->'{filter_.key}' {adb_operator} '[\"{filter_.value}\"]'"
-        )
+        if isinstance(filter_.value, list) or filter_.value is None:
+            raise ValueError(
+                f"Filter operator {filter_.operator} requires a scalar value."
+            )
+        # Validate the type before JSON-encoding.
+        _to_sql_literal(filter_.value)
+        contains_json = _to_sql_literal(json.dumps([filter_.value]))
+        return f"metadata_::jsonb->{key} {adb_operator} {contains_json}::jsonb"
     else:
-        return f"metadata_->>'{filter_.key}' {adb_operator} '{filter_.value}'"
+        return f"metadata_->>{key} {adb_operator} {_to_sql_literal(filter_.value)}"
 
 
 def _recursively_parse_adb_filter(filters: MetadataFilters) -> Union[str, None]:

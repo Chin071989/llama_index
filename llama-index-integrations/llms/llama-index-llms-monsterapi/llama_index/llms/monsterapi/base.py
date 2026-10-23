@@ -48,13 +48,14 @@ class MonsterLLM(OpenAI):
 
         1. MonsterAPI Private LLM Deployment use case
         ```python
+        import os
         from llama_index.llms.monsterapi import MonsterLLM
         # User monsterAPI Deploy service to launch a deployment
         # then get api_endpoint and api_auth_token and use them as api_base and api_key respectively.
         llm = MonsterLLM(
             model = "whatever is the basemodel used to deploy the llm",
-            api_base="https://ecc7deb6-26e0-419b-a7f2-0deb934af29a.monsterapi.ai",
-            api_key="a0f8a6ba-c32f-4407-af0c-169f1915490c",
+            api_base=os.environ["MONSTER_API_BASE"],
+            api_key=os.environ["MONSTER_API_KEY"],
             temperature=0.75,
         )
 

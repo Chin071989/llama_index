@@ -43,15 +43,31 @@ def _default_tokenizer(text: str) -> List[str]:
 
 
 def escape_str(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"escape_str expects a str, got {type(value).__name__}")
     BS = "\\"
     must_escape = (BS, "'")
-    return (
-        "".join(f"{BS}{c}" if c in must_escape else c for c in value) if value else ""
-    )
+    return "".join(f"{BS}{c}" if c in must_escape else c for c in value)
+
+
+def quote_str(value: str) -> str:
+    return f"'{escape_str(value)}'"
 
 
 def format_list_to_string(lst: List) -> str:
-    return "[" + ",".join(escape_str(str(item)) for item in lst) + "]"
+    return "[" + ",".join(str(float(item)) for item in lst) + "]"
+
+
+def format_str_list_to_string(lst: List) -> str:
+    return "[" + ",".join(quote_str(str(item)) for item in lst) + "]"
+
+
+def _filter_value_to_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    raise ValueError(f"Unsupported metadata filter value type: {type(value).__name__}")
 
 
 DISTANCE_MAPPING = {
@@ -394,11 +410,20 @@ class ClickHouseVectorStore(BasePydanticVectorStore):
         filter_conditions = []
         for filter_item in exact_match_filter:
             # Use JSONExtractString function with properly escaped keys and values
-            key = escape_str(filter_item.key)
-            value = escape_str(filter_item.value)
-            filter_conditions.append(
-                f"JSONExtractString({self.metadata_column}, '{key}') = '{value}'"
-            )
+            column = f"JSONExtractString({self.metadata_column}, {quote_str(filter_item.key)})"
+            value = filter_item.value
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    filter_conditions.append("0")
+                    continue
+                values = ", ".join(
+                    quote_str(_filter_value_to_str(item)) for item in value
+                )
+                filter_conditions.append(f"{column} IN ({values})")
+            else:
+                filter_conditions.append(
+                    f"{column} = {quote_str(_filter_value_to_str(value))}"
+                )
 
         filter_str = " AND ".join(filter_conditions)
 
@@ -460,10 +485,11 @@ class ClickHouseVectorStore(BasePydanticVectorStore):
         query_embedding = cast(List[float], query.query_embedding)
         where_str = where
         if query.doc_ids:
+            doc_id_filter = f"doc_id IN {format_str_list_to_string(query.doc_ids)}"
             if where_str is not None:
-                where_str = f"{where_str} AND {f'doc_id IN {format_list_to_string(query.doc_ids)}'}"
+                where_str = f"{where_str} AND {doc_id_filter}"
             else:
-                where_str = f"doc_id IN {format_list_to_string(query.doc_ids)}"
+                where_str = doc_id_filter
 
         # TODO: Support other filter types
         if query.filters is not None and len(query.filters.legacy_filters()) > 0:

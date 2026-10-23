@@ -3220,3 +3220,72 @@ async def test_mmr_query_filters_out_empty_embeddings_in_mixed_results(use_async
     assert "e1" not in result.ids
     assert "v1" in result.ids
     assert "v2" in result.ids
+
+
+INJECTION_PAYLOADS = [
+    MetadataFilter(key="test_key", value="x' OR '1'='1"),
+    MetadataFilter(key="test_key' OR '1'='1' OR 'a", value="test_value"),
+    MetadataFilter(
+        key="test_key", value=["x') OR ('1'='1"], operator=FilterOperator.IN
+    ),
+    MetadataFilter(
+        key="test_key", value="x%' OR '1'='1", operator=FilterOperator.TEXT_MATCH
+    ),
+    MetadataFilter(
+        key="test_key_list",
+        value="x\"]' OR '1'='1",
+        operator=FilterOperator.CONTAINS,
+    ),
+    MetadataFilter(
+        key="test_key_list",
+        value=["x'] OR '1'='1' OR array['y"],
+        operator=FilterOperator.ANY,
+    ),
+]
+
+
+@pytest.mark.skipif(postgres_not_available, reason="postgres db is not available")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async", [True, False])
+@pytest.mark.parametrize("injection_filter", INJECTION_PAYLOADS)
+async def test_metadata_filters_are_not_sql_injectable(
+    pg: PGVectorStore,
+    node_embeddings: List[TextNode],
+    use_async: bool,
+    injection_filter: MetadataFilter,
+) -> None:
+    pg.add(node_embeddings)
+    filters = MetadataFilters(filters=[injection_filter])
+    q = VectorStoreQuery(
+        query_embedding=_get_sample_vector(0.5), similarity_top_k=10, filters=filters
+    )
+    if use_async:
+        res = await pg.aquery(q)
+        await pg.adelete_nodes(filters=filters)
+        remaining = await pg.aget_nodes(node_ids=[n.node_id for n in node_embeddings])
+    else:
+        res = pg.query(q)
+        pg.delete_nodes(filters=filters)
+        remaining = pg.get_nodes(node_ids=[n.node_id for n in node_embeddings])
+    assert res.nodes == []
+    assert len(remaining) == len(node_embeddings)
+
+
+@pytest.mark.skipif(postgres_not_available, reason="postgres db is not available")
+def test_metadata_filter_value_with_quote_matches(pg: PGVectorStore) -> None:
+    pg.add(
+        [
+            TextNode(
+                text="quoted",
+                id_="quoted",
+                extra_info={"author": "O'Brien"},
+                embedding=_get_sample_vector(1.0),
+            )
+        ]
+    )
+    filters = MetadataFilters(filters=[MetadataFilter(key="author", value="O'Brien")])
+    q = VectorStoreQuery(
+        query_embedding=_get_sample_vector(0.5), similarity_top_k=10, filters=filters
+    )
+    res = pg.query(q)
+    assert [n.node_id for n in res.nodes] == ["quoted"]

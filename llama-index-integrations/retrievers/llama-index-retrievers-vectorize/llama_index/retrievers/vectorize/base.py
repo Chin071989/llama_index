@@ -95,7 +95,7 @@ class VectorizeRetriever(BaseRetriever):
         else:
             host = "https://api-staging.vectorize.io/v1"
         api = ApiClient(
-            Configuration(host=host, access_token=api_token, debug=True),
+            Configuration(host=host, access_token=api_token),
             header_name,
             header_value,
         )

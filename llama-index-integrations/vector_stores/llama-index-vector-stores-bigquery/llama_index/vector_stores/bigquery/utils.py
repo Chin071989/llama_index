@@ -106,7 +106,7 @@ def _build_filter_clause(
 ) -> Tuple[
     str, List[Union[bigquery.ScalarQueryParameter, bigquery.ArrayQueryParameter]]
 ]:
-    field = filter_.key
+    field = _validate_metadata_key(filter_.key)
     operator = filter_.operator
     value = filter_.value
 
@@ -123,13 +123,11 @@ def _build_filter_clause(
         ]
     elif operator == FilterOperator.TEXT_MATCH:
         bigquery_operator = _llama_to_bigquery_operator(operator)
-        clause = (
-            f"SAFE.JSON_VALUE(metadata, '$.\"{field}\"') {bigquery_operator} '{value}'"
-        )
+        clause = f"SAFE.JSON_VALUE(metadata, '$.\"{field}\"') {bigquery_operator} ?"
         params = [bigquery.ScalarQueryParameter(name=None, type_="STRING", value=value)]
     elif operator == FilterOperator.TEXT_MATCH_INSENSITIVE:
         bigquery_operator = _llama_to_bigquery_operator(operator)
-        clause = f"LOWER(SAFE.JSON_VALUE(metadata, '$.\"{field}\"')) {bigquery_operator} LOWER('{value}')"
+        clause = f"LOWER(SAFE.JSON_VALUE(metadata, '$.\"{field}\"')) {bigquery_operator} LOWER(?)"
         params = [bigquery.ScalarQueryParameter(name=None, type_="STRING", value=value)]
     else:
         bigquery_operator = _llama_to_bigquery_operator(operator)
@@ -137,6 +135,13 @@ def _build_filter_clause(
         params = [bigquery.ScalarQueryParameter(name=None, type_="STRING", value=value)]
 
     return clause, params
+
+
+def _validate_metadata_key(key: str) -> str:
+    # Keys are embedded in a quoted JSONPath string literal; reject breakout characters.
+    if not key or any(c in key for c in "\"'\\`") or not key.isprintable():
+        raise ValueError(f"Invalid metadata filter key: {key!r}")
+    return key
 
 
 def _llama_to_bigquery_operator(operator: FilterOperator) -> str:

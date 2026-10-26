@@ -35,6 +35,13 @@ from llama_index.core.vector_stores.utils import (
 _logger = logging.getLogger(__name__)
 
 
+def _validate_metadata_key(key: str) -> str:
+    # Keys are embedded in a JSON path string literal; reject breakout characters.
+    if not key or any(c in key for c in "\"'\\`") or not key.isprintable():
+        raise ValueError(f"Invalid metadata filter key: {key!r}")
+    return key
+
+
 @dataclass
 class DBEmbeddingRow:
     """Internal helper struct representing a row fetched from the DB."""
@@ -523,7 +530,7 @@ class VolcengineMySQLVectorStore(BasePydanticVectorStore):
         - For ``IN``/``NIN`` operators build a ``(v1, v2, ...)`` value
           list.
         """
-        key_expr = f"JSON_EXTRACT(metadata, '$.{filter_.key}')"
+        key_expr = f"JSON_EXTRACT(metadata, '$.{_validate_metadata_key(filter_.key)}')"
         value = filter_.value
 
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:

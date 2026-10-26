@@ -26,6 +26,13 @@ from llama_index.core.vector_stores.utils import (
 )
 
 
+def _validate_metadata_key(key: str) -> str:
+    # Keys are embedded in a JSON path string literal; reject breakout characters.
+    if not key or any(c in key for c in "\"'\\`") or not key.isprintable():
+        raise ValueError(f"Invalid metadata filter key: {key!r}")
+    return key
+
+
 class DBEmbeddingRow(NamedTuple):
     node_id: str
     text: str
@@ -373,7 +380,7 @@ class AlibabaCloudMySQLVectorStore(BasePydanticVectorStore):
             filter_value = f":{param_name}"
             params[param_name] = filter_.value
 
-        clause = f"JSON_VALUE(metadata, '$.{filter_.key}') {self._to_mysql_operator(filter_.operator)} {filter_value}"
+        clause = f"JSON_VALUE(metadata, '$.{_validate_metadata_key(filter_.key)}') {self._to_mysql_operator(filter_.operator)} {filter_value}"
         return clause, params
 
     def _filters_to_where_clause(

@@ -6,7 +6,7 @@ import logging
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, MetadataMode, TextNode
@@ -145,60 +145,69 @@ def _to_couchbase_filter(standard_filters: MetadataFilters) -> Dict[str, Any]:
     return {"query": filters}
 
 
+def _escape_sqlpp_field_path(path: str) -> str:
+    """Escape a (possibly dotted) field path as backtick-quoted SQL++ identifiers."""
+    parts = path.split(".")
+    for part in parts:
+        if not part or "`" in part:
+            raise ValueError(f"Invalid metadata filter key: {path!r}")
+    return ".".join(f"`{part}`" for part in parts)
+
+
 def _convert_llamaindex_filters_to_sql(
-    filters: MetadataFilters, metadata_key: str
-) -> str:
+    filters: MetadataFilters,
+    metadata_key: str,
+    named_parameters: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     """
-    Convert LlamaIndex MetadataFilters to SQL++ WHERE clause.
+    Convert LlamaIndex MetadataFilters to a parameterized SQL++ WHERE clause.
+
+    Filter keys are escaped as identifiers and filter values are bound as
+    named parameters, since both may originate from untrusted input.
 
     Args:
         filters: LlamaIndex MetadataFilters object
         metadata_key: The metadata field prefix for the document
+        named_parameters: Dict to collect named parameters into (used for recursion)
 
     Returns:
-        SQL++ WHERE clause string
+        Tuple of the SQL++ WHERE clause string and its named parameters
 
     """
+    if named_parameters is None:
+        named_parameters = {}
+
     if not filters or not filters.filters:
-        return ""
+        return "", named_parameters
+
+    operator_map = {
+        FilterOperator.EQ: "=",
+        FilterOperator.NE: "!=",
+        FilterOperator.GT: ">",
+        FilterOperator.GTE: ">=",
+        FilterOperator.LT: "<",
+        FilterOperator.LTE: "<=",
+        FilterOperator.IN: "IN",
+    }
 
     def _build_condition(filter_item: Any) -> str:
         """Build a single SQL++ condition from a MetadataFilter."""
-        field_name = f"d.{metadata_key}.{filter_item.key}"
-
-        if filter_item.operator == FilterOperator.EQ:
-            if isinstance(filter_item.value, str):
-                return f"{field_name} = '{filter_item.value}'"
-            else:
-                return f"{field_name} = {filter_item.value}"
-        elif filter_item.operator == FilterOperator.NE:
-            if isinstance(filter_item.value, str):
-                return f"{field_name} != '{filter_item.value}'"
-            else:
-                return f"{field_name} != {filter_item.value}"
-        elif filter_item.operator == FilterOperator.GT:
-            return f"{field_name} > {filter_item.value}"
-        elif filter_item.operator == FilterOperator.GTE:
-            return f"{field_name} >= {filter_item.value}"
-        elif filter_item.operator == FilterOperator.LT:
-            return f"{field_name} < {filter_item.value}"
-        elif filter_item.operator == FilterOperator.LTE:
-            return f"{field_name} <= {filter_item.value}"
-        elif filter_item.operator == FilterOperator.IN:
-            if isinstance(filter_item.value, list):
-                values = ", ".join(
-                    [
-                        f"'{v}'" if isinstance(v, str) else str(v)
-                        for v in filter_item.value
-                    ]
-                )
-                return f"{field_name} IN [{values}]"
-            else:
-                raise ValueError(
-                    f"'in' operator expects a list value, got {type(filter_item.value)}"
-                )
-        else:
+        if filter_item.operator not in operator_map:
             raise ValueError(f"Unsupported filter operator: {filter_item.operator}")
+        if filter_item.operator == FilterOperator.IN and not isinstance(
+            filter_item.value, list
+        ):
+            raise ValueError(
+                f"'in' operator expects a list value, got {type(filter_item.value)}"
+            )
+
+        field_name = (
+            f"d.{_escape_sqlpp_field_path(metadata_key)}."
+            f"{_escape_sqlpp_field_path(filter_item.key)}"
+        )
+        param_name = f"filter_param_{len(named_parameters)}"
+        named_parameters[param_name] = filter_item.value
+        return f"{field_name} {operator_map[filter_item.operator]} ${param_name}"
 
     # Build conditions for all filters
     filter_conditions = []
@@ -207,22 +216,21 @@ def _convert_llamaindex_filters_to_sql(
             condition = _build_condition(filter_item)
             filter_conditions.append(condition)
         elif isinstance(filter_item, MetadataFilters):
-            condition = (
-                "("
-                + _convert_llamaindex_filters_to_sql(filter_item, metadata_key)
-                + ")"
+            sub_clause, _ = _convert_llamaindex_filters_to_sql(
+                filter_item, metadata_key, named_parameters
             )
-            filter_conditions.append(condition)
+            if sub_clause:
+                filter_conditions.append(f"({sub_clause})")
         else:
             logger.warning(f"Unsupported filter type: {type(filter_item)}")
             continue
 
     if not filter_conditions:
-        return ""
+        return "", named_parameters
 
     # Join conditions based on the filter condition (AND/OR)
     condition_connector = " AND " if filters.condition == "and" else " OR "
-    return condition_connector.join(filter_conditions)
+    return condition_connector.join(filter_conditions), named_parameters
 
 
 class CouchbaseVectorStoreBase(BasePydanticVectorStore):
@@ -856,16 +864,14 @@ class CouchbaseQueryVectorStore(CouchbaseVectorStoreBase):
 
         # Handle filters if provided
         where_clause = ""
+        filter_params: Dict[str, Any] = {}
         if query.filters:
-            try:
-                # Convert LlamaIndex filters to SQL++ conditions
-                filter_sql = _convert_llamaindex_filters_to_sql(
-                    query.filters, self._metadata_key
-                )
-                if filter_sql:
-                    where_clause = f"WHERE {filter_sql}"
-            except Exception as e:
-                logger.warning(f"Failed to process filters: {e}")
+            # Convert LlamaIndex filters to parameterized SQL++ conditions
+            filter_sql, filter_params = _convert_llamaindex_filters_to_sql(
+                query.filters, self._metadata_key
+            )
+            if filter_sql:
+                where_clause = f"WHERE {filter_sql}"
 
         if query.output_fields:
             fields = query.output_fields.join(",")
@@ -894,7 +900,15 @@ class CouchbaseQueryVectorStore(CouchbaseVectorStoreBase):
 
         try:
             # Execute the query
-            result = self._cluster.query(query_str, self._query_options)
+            query_options = self._query_options
+            if filter_params:
+                query_options = (
+                    self._query_options.copy()
+                    if self._query_options
+                    else QueryOptions()
+                )
+                query_options["named_parameters"] = filter_params
+            result = self._cluster.query(query_str, query_options)
 
             top_k_nodes = []
             top_k_scores = []

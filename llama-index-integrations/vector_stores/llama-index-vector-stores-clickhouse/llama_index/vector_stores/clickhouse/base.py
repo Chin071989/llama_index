@@ -82,7 +82,8 @@ def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> st
             if not -(2**255) <= item < 2**255:
                 raise ValueError("Integer metadata filter value out of range")
             int_values.append(str(int(item)))
-            int_as_float_values.append(repr(float(item)))
+            if float(item) == item:
+                int_as_float_values.append(repr(float(item)))
         elif isinstance(item, float):
             float_values.append(repr(float(item)))
         else:
@@ -102,7 +103,7 @@ def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> st
             f"toInt256OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
             f"IN ({', '.join(int_values)})"
         )
-        # Integral JSON doubles (e.g. 2.02e3) only; JSON ints are compared exactly.
+        # Integral JSON doubles (e.g. 2.02e3), for ints exactly representable as float.
         conditions.append(
             f"(JSONType({metadata_column}, {key_sql}) = 'Double' AND "
             f"JSONExtractFloat({metadata_column}, {key_sql}) "

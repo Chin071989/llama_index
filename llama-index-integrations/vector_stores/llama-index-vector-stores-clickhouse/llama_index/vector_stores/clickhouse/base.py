@@ -69,15 +69,22 @@ def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> st
         return "0"
 
     str_values: List[str] = []
-    num_values: List[str] = []
+    int_values: List[str] = []
+    int_as_float_values: List[str] = []
+    float_values: List[str] = []
     match_null = False
     for item in items:
         if item is None:
             match_null = True
         elif isinstance(item, str):
             str_values.append(quote_str(item))
-        elif isinstance(item, (int, float)):
-            num_values.append(repr(float(item)))
+        elif isinstance(item, int):
+            if not -(2**255) <= item < 2**255:
+                raise ValueError("Integer metadata filter value out of range")
+            int_values.append(str(int(item)))
+            int_as_float_values.append(repr(float(item)))
+        elif isinstance(item, float):
+            float_values.append(repr(float(item)))
         else:
             raise ValueError(
                 f"Unsupported metadata filter value type: {type(item).__name__}"
@@ -90,10 +97,21 @@ def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> st
             f"JSONExtractString({metadata_column}, {key_sql}) "
             f"IN ({', '.join(str_values)}))"
         )
-    if num_values:
+    if int_values:
+        conditions.append(
+            f"toInt256OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
+            f"IN ({', '.join(int_values)})"
+        )
+        # Integral JSON doubles (e.g. 2.02e3) only; JSON ints are compared exactly.
+        conditions.append(
+            f"(JSONType({metadata_column}, {key_sql}) = 'Double' AND "
+            f"JSONExtractFloat({metadata_column}, {key_sql}) "
+            f"IN ({', '.join(int_as_float_values)}))"
+        )
+    if float_values:
         conditions.append(
             f"toFloat64OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
-            f"IN ({', '.join(num_values)})"
+            f"IN ({', '.join(float_values)})"
         )
     if match_null:
         conditions.append(

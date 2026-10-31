@@ -496,6 +496,10 @@ _ROWS = [
     ("null", '{"author":null}'),
     ("empty", '{"author":""}'),
     ("missing", "{}"),
+    ("big0", '{"id_num":9007199254740992}'),
+    ("big1", '{"id_num":9007199254740993}'),
+    ("dbl", '{"id_num":3.0}'),
+    ("exp", '{"id_num":2.02e3}'),
 ]
 
 
@@ -542,6 +546,19 @@ def test_meta_filter_matches_on_engine() -> None:
     assert _matching_ids(
         MetadataFilters(filters=[MetadataFilter(key="year", value=[2020, 2020.5])])
     ) == ["b", "s"]
+
+    def num_ids(value: Any) -> List[str]:
+        return _matching_ids(
+            MetadataFilters(filters=[MetadataFilter(key="id_num", value=value)])
+        )
+
+    assert num_ids(9007199254740993) == ["big1"]
+    assert num_ids(9007199254740992) == ["big0"]
+    assert num_ids(3) == ["dbl"]
+    assert num_ids(2020) == ["exp"]
+    assert num_ids([3, 9007199254740993]) == ["big1", "dbl"]
+    with pytest.raises(ValueError):
+        _metadata_filter_condition("metadata", "id_num", 2**255)
 
 
 def test_format_str_list_quotes_and_escapes() -> None:

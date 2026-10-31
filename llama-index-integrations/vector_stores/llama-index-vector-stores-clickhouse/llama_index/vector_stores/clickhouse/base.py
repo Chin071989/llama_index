@@ -103,6 +103,7 @@ def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> st
             f"toInt256OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
             f"IN ({', '.join(int_values)})"
         )
+    if int_as_float_values:
         # Integral JSON doubles (e.g. 2.02e3), for ints exactly representable as float.
         conditions.append(
             f"(JSONType({metadata_column}, {key_sql}) = 'Double' AND "

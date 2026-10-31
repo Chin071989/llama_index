@@ -10,12 +10,18 @@ from llama_index.core.schema import (
 )
 from llama_index.core.vector_stores.types import (
     ExactMatchFilter,
+    MetadataFilter,
     MetadataFilters,
     VectorStoreQuery,
     VectorStoreQueryMode,
     BasePydanticVectorStore,
 )
 from llama_index.vector_stores.clickhouse import ClickHouseVectorStore
+from llama_index.vector_stores.clickhouse.base import (
+    _metadata_filter_condition,
+    escape_str,
+    format_str_list_to_string,
+)
 
 ##
 # Start ClickHouse locally
@@ -466,3 +472,96 @@ def test_table_dropped_when_requested(
 
     # Clean up
     store2.drop()
+
+
+def _meta_filter_sql(filters: MetadataFilters) -> str:
+    from types import SimpleNamespace
+
+    return ClickHouseVectorStore._append_meta_filter_condition(
+        SimpleNamespace(metadata_column="metadata"), None, filters.legacy_filters()
+    )
+
+
+def test_escape_str_rejects_non_str() -> None:
+    assert escape_str("a'b\\c") == "a\\'b\\\\c"
+    with pytest.raises(TypeError):
+        escape_str(["x' OR 1=1 --"])  # type: ignore[arg-type]
+
+
+_ROWS = [
+    ("s", '{"author":"alice","year":2020}'),
+    ("inj", '{"author":"x\' OR 1=1 --"}'),
+    ("b", '{"author":"bob","year":2020.5}'),
+    ("strnum", '{"author":"carol","year":"2020"}'),
+    ("null", '{"author":null}'),
+    ("empty", '{"author":""}'),
+    ("missing", "{}"),
+    ("big0", '{"id_num":9007199254740992}'),
+    ("big1", '{"id_num":9007199254740993}'),
+    ("dbl", '{"id_num":3.0}'),
+    ("exp", '{"id_num":2.02e3}'),
+]
+
+
+def _matching_ids(filters: MetadataFilters) -> List[str]:
+    chdb = pytest.importorskip("chdb")
+    values = ", ".join(f"('{i}', '{escape_str(m)}')" for i, m in _ROWS)
+    sql = (
+        f"SELECT id FROM values('id String, metadata String', {values})\n"
+        f"WHERE {_meta_filter_sql(filters)}\nORDER BY id"
+    )
+    return chdb.query(sql, "CSV").data().replace('"', "").split()
+
+
+def test_meta_filter_sql_is_escaped() -> None:
+    sql = _meta_filter_sql(
+        MetadataFilters(
+            filters=[MetadataFilter(key="a'uthor", value=["x' OR 1=1 --", "b\\"])]
+        )
+    )
+    assert "'a\\'uthor'" in sql
+    assert "IN ('x\\' OR 1=1 --', 'b\\\\')" in sql
+    with pytest.raises(ValueError):
+        _metadata_filter_condition("metadata", "author", [object()])
+    with pytest.raises(TypeError):
+        _metadata_filter_condition("metadata", ["author"], "x")  # type: ignore[arg-type]
+
+
+def test_meta_filter_matches_on_engine() -> None:
+    def ids(value: Any) -> List[str]:
+        return _matching_ids(
+            MetadataFilters(filters=[MetadataFilter(key="author", value=value)])
+        )
+
+    assert ids(["x' OR 1=1 --"]) == ["inj"]
+    assert ids("x' OR 1=1 --") == ["inj"]
+    assert ids("alice") == ["s"]
+    assert ids(["alice", "bob"]) == ["b", "s"]
+    assert ids([]) == []
+    assert ids("") == ["empty"]
+    assert ids(None) == ["null"]
+    assert _matching_ids(
+        MetadataFilters(filters=[MetadataFilter(key="year", value=2020)])
+    ) == ["s"]
+    assert _matching_ids(
+        MetadataFilters(filters=[MetadataFilter(key="year", value=[2020, 2020.5])])
+    ) == ["b", "s"]
+
+    def num_ids(value: Any) -> List[str]:
+        return _matching_ids(
+            MetadataFilters(filters=[MetadataFilter(key="id_num", value=value)])
+        )
+
+    assert num_ids(9007199254740993) == ["big1"]
+    assert num_ids(9007199254740992) == ["big0"]
+    assert num_ids(3) == ["dbl"]
+    assert num_ids(2020) == ["exp"]
+    assert num_ids([3, 9007199254740993]) == ["big1", "dbl"]
+    with pytest.raises(ValueError):
+        _metadata_filter_condition("metadata", "id_num", 2**255)
+
+
+def test_format_str_list_quotes_and_escapes() -> None:
+    assert format_str_list_to_string(["a", "x'] OR 1=1 --"]) == (
+        "['a','x\\'] OR 1=1 --']"
+    )

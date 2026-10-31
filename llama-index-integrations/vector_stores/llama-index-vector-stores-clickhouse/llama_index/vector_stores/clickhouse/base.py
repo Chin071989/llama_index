@@ -43,15 +43,86 @@ def _default_tokenizer(text: str) -> List[str]:
 
 
 def escape_str(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"escape_str expects a str, got {type(value).__name__}")
     BS = "\\"
     must_escape = (BS, "'")
-    return (
-        "".join(f"{BS}{c}" if c in must_escape else c for c in value) if value else ""
-    )
+    return "".join(f"{BS}{c}" if c in must_escape else c for c in value)
+
+
+def quote_str(value: str) -> str:
+    return f"'{escape_str(value)}'"
 
 
 def format_list_to_string(lst: List) -> str:
-    return "[" + ",".join(escape_str(str(item)) for item in lst) + "]"
+    return "[" + ",".join(str(float(item)) for item in lst) + "]"
+
+
+def format_str_list_to_string(lst: List) -> str:
+    return "[" + ",".join(quote_str(str(item)) for item in lst) + "]"
+
+
+def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> str:
+    key_sql = quote_str(key)
+    items = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not items:
+        return "0"
+
+    str_values: List[str] = []
+    int_values: List[str] = []
+    int_as_float_values: List[str] = []
+    float_values: List[str] = []
+    match_null = False
+    for item in items:
+        if item is None:
+            match_null = True
+        elif isinstance(item, str):
+            str_values.append(quote_str(item))
+        elif isinstance(item, int):
+            if not -(2**255) <= item < 2**255:
+                raise ValueError("Integer metadata filter value out of range")
+            int_values.append(str(int(item)))
+            if float(item) == item:
+                int_as_float_values.append(repr(float(item)))
+        elif isinstance(item, float):
+            float_values.append(repr(float(item)))
+        else:
+            raise ValueError(
+                f"Unsupported metadata filter value type: {type(item).__name__}"
+            )
+
+    conditions = []
+    if str_values:
+        conditions.append(
+            f"(JSONType({metadata_column}, {key_sql}) = 'String' AND "
+            f"JSONExtractString({metadata_column}, {key_sql}) "
+            f"IN ({', '.join(str_values)}))"
+        )
+    if int_values:
+        conditions.append(
+            f"toInt256OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
+            f"IN ({', '.join(int_values)})"
+        )
+    if int_as_float_values:
+        # Integral JSON doubles (e.g. 2.02e3), for ints exactly representable as float.
+        conditions.append(
+            f"(JSONType({metadata_column}, {key_sql}) = 'Double' AND "
+            f"JSONExtractFloat({metadata_column}, {key_sql}) "
+            f"IN ({', '.join(int_as_float_values)}))"
+        )
+    if float_values:
+        conditions.append(
+            f"toFloat64OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
+            f"IN ({', '.join(float_values)})"
+        )
+    if match_null:
+        conditions.append(
+            f"(JSONHas({metadata_column}, {key_sql}) AND "
+            f"JSONType({metadata_column}, {key_sql}) = 'Null')"
+        )
+    if len(conditions) == 1:
+        return conditions[0]
+    return "(" + " OR ".join(conditions) + ")"
 
 
 DISTANCE_MAPPING = {
@@ -393,11 +464,10 @@ class ClickHouseVectorStore(BasePydanticVectorStore):
 
         filter_conditions = []
         for filter_item in exact_match_filter:
-            # Use JSONExtractString function with properly escaped keys and values
-            key = escape_str(filter_item.key)
-            value = escape_str(filter_item.value)
             filter_conditions.append(
-                f"JSONExtractString({self.metadata_column}, '{key}') = '{value}'"
+                _metadata_filter_condition(
+                    self.metadata_column, filter_item.key, filter_item.value
+                )
             )
 
         filter_str = " AND ".join(filter_conditions)
@@ -460,10 +530,11 @@ class ClickHouseVectorStore(BasePydanticVectorStore):
         query_embedding = cast(List[float], query.query_embedding)
         where_str = where
         if query.doc_ids:
+            doc_id_filter = f"doc_id IN {format_str_list_to_string(query.doc_ids)}"
             if where_str is not None:
-                where_str = f"{where_str} AND {f'doc_id IN {format_list_to_string(query.doc_ids)}'}"
+                where_str = f"{where_str} AND {doc_id_filter}"
             else:
-                where_str = f"doc_id IN {format_list_to_string(query.doc_ids)}"
+                where_str = doc_id_filter
 
         # TODO: Support other filter types
         if query.filters is not None and len(query.filters.legacy_filters()) > 0:

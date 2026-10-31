@@ -18,6 +18,7 @@ from llama_index.core.vector_stores.types import (
 )
 from llama_index.vector_stores.clickhouse import ClickHouseVectorStore
 from llama_index.vector_stores.clickhouse.base import (
+    _metadata_filter_condition,
     escape_str,
     format_str_list_to_string,
 )
@@ -487,34 +488,60 @@ def test_escape_str_rejects_non_str() -> None:
         escape_str(["x' OR 1=1 --"])  # type: ignore[arg-type]
 
 
-def test_meta_filter_escapes_str_value() -> None:
-    sql = _meta_filter_sql(
-        MetadataFilters(filters=[ExactMatchFilter(key="a'uthor", value="x' OR 1=1 --")])
+_ROWS = [
+    ("s", '{"author":"alice","year":2020}'),
+    ("inj", '{"author":"x\' OR 1=1 --"}'),
+    ("b", '{"author":"bob","year":2020.5}'),
+    ("strnum", '{"author":"carol","year":"2020"}'),
+    ("null", '{"author":null}'),
+    ("empty", '{"author":""}'),
+    ("missing", "{}"),
+]
+
+
+def _matching_ids(filters: MetadataFilters) -> List[str]:
+    chdb = pytest.importorskip("chdb")
+    values = ", ".join(f"('{i}', '{escape_str(m)}')" for i, m in _ROWS)
+    sql = (
+        f"SELECT id FROM values('id String, metadata String', {values})\n"
+        f"WHERE {_meta_filter_sql(filters)}\nORDER BY id"
     )
-    assert sql == ("JSONExtractString(metadata, 'a\\'uthor') = 'x\\' OR 1=1 --'")
+    return chdb.query(sql, "CSV").data().replace('"', "").split()
 
 
-def test_meta_filter_escapes_list_value() -> None:
+def test_meta_filter_sql_is_escaped() -> None:
     sql = _meta_filter_sql(
         MetadataFilters(
-            filters=[MetadataFilter(key="author", value=["x' OR 1=1 --", "b\\"])]
+            filters=[MetadataFilter(key="a'uthor", value=["x' OR 1=1 --", "b\\"])]
         )
     )
-    assert sql == (
-        "JSONExtractString(metadata, 'author') IN ('x\\' OR 1=1 --', 'b\\\\')"
-    )
+    assert "'a\\'uthor'" in sql
+    assert "IN ('x\\' OR 1=1 --', 'b\\\\')" in sql
+    with pytest.raises(ValueError):
+        _metadata_filter_condition("metadata", "author", [object()])
+    with pytest.raises(TypeError):
+        _metadata_filter_condition("metadata", ["author"], "x")  # type: ignore[arg-type]
 
 
-def test_meta_filter_numeric_and_empty_list_values() -> None:
-    assert _meta_filter_sql(
+def test_meta_filter_matches_on_engine() -> None:
+    def ids(value: Any) -> List[str]:
+        return _matching_ids(
+            MetadataFilters(filters=[MetadataFilter(key="author", value=value)])
+        )
+
+    assert ids(["x' OR 1=1 --"]) == ["inj"]
+    assert ids("x' OR 1=1 --") == ["inj"]
+    assert ids("alice") == ["s"]
+    assert ids(["alice", "bob"]) == ["b", "s"]
+    assert ids([]) == []
+    assert ids("") == ["empty"]
+    assert ids(None) == ["null"]
+    assert _matching_ids(
         MetadataFilters(filters=[MetadataFilter(key="year", value=2020)])
-    ) == ("JSONExtractString(metadata, 'year') = '2020'")
-    assert (
-        _meta_filter_sql(
-            MetadataFilters(filters=[MetadataFilter(key="author", value=[])])
-        )
-        == "0"
-    )
+    ) == ["s"]
+    assert _matching_ids(
+        MetadataFilters(filters=[MetadataFilter(key="year", value=[2020, 2020.5])])
+    ) == ["b", "s"]
 
 
 def test_format_str_list_quotes_and_escapes() -> None:

@@ -62,12 +62,47 @@ def format_str_list_to_string(lst: List) -> str:
     return "[" + ",".join(quote_str(str(item)) for item in lst) + "]"
 
 
-def _filter_value_to_str(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (str, int, float)):
-        return str(value)
-    raise ValueError(f"Unsupported metadata filter value type: {type(value).__name__}")
+def _metadata_filter_condition(metadata_column: str, key: str, value: Any) -> str:
+    key_sql = quote_str(key)
+    items = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not items:
+        return "0"
+
+    str_values: List[str] = []
+    num_values: List[str] = []
+    match_null = False
+    for item in items:
+        if item is None:
+            match_null = True
+        elif isinstance(item, str):
+            str_values.append(quote_str(item))
+        elif isinstance(item, (int, float)):
+            num_values.append(repr(float(item)))
+        else:
+            raise ValueError(
+                f"Unsupported metadata filter value type: {type(item).__name__}"
+            )
+
+    conditions = []
+    if str_values:
+        conditions.append(
+            f"(JSONType({metadata_column}, {key_sql}) = 'String' AND "
+            f"JSONExtractString({metadata_column}, {key_sql}) "
+            f"IN ({', '.join(str_values)}))"
+        )
+    if num_values:
+        conditions.append(
+            f"toFloat64OrNull(JSONExtractRaw({metadata_column}, {key_sql})) "
+            f"IN ({', '.join(num_values)})"
+        )
+    if match_null:
+        conditions.append(
+            f"(JSONHas({metadata_column}, {key_sql}) AND "
+            f"JSONType({metadata_column}, {key_sql}) = 'Null')"
+        )
+    if len(conditions) == 1:
+        return conditions[0]
+    return "(" + " OR ".join(conditions) + ")"
 
 
 DISTANCE_MAPPING = {
@@ -409,21 +444,11 @@ class ClickHouseVectorStore(BasePydanticVectorStore):
 
         filter_conditions = []
         for filter_item in exact_match_filter:
-            # Use JSONExtractString function with properly escaped keys and values
-            column = f"JSONExtractString({self.metadata_column}, {quote_str(filter_item.key)})"
-            value = filter_item.value
-            if isinstance(value, (list, tuple)):
-                if not value:
-                    filter_conditions.append("0")
-                    continue
-                values = ", ".join(
-                    quote_str(_filter_value_to_str(item)) for item in value
+            filter_conditions.append(
+                _metadata_filter_condition(
+                    self.metadata_column, filter_item.key, filter_item.value
                 )
-                filter_conditions.append(f"{column} IN ({values})")
-            else:
-                filter_conditions.append(
-                    f"{column} = {quote_str(_filter_value_to_str(value))}"
-                )
+            )
 
         filter_str = " AND ".join(filter_conditions)
 

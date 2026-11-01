@@ -1175,7 +1175,7 @@ wheels = [
 
 [[package]]
 name = "datamodel-code-generator"
-version = "0.76.0"
+version = "0.87.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argcomplete" },
@@ -1186,10 +1186,11 @@ dependencies = [
     { name = "jinja2" },
     { name = "pydantic" },
     { name = "pyyaml" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5c/65/27983214b172cf5463209ef55b68f7bb180eaeb114fbca477f709e2ca721/datamodel_code_generator-0.76.0.tar.gz", hash = "sha256:782ad3d17ea53f3a2300347d4058e281ba749ff57821712464f88c1ce75876c8", size = 2184419, upload-time = "2026-08-29T02:04:09.432Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/19/3c2b71dbeea9e50f3d845cdee6aa46ea4629ae5f13ed534d41ef680bc633/datamodel_code_generator-0.87.0.tar.gz", hash = "sha256:fd1404cd3033d63e6c322bce5bd0682699f9597ff4a14fa062620121651f850c", size = 7713321, upload-time = "2026-10-28T14:43:54.467Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/57/72/801a441c9d3717c9fab3399a382ed2d146cc79df12b8ea45427ce26d55a3/datamodel_code_generator-0.76.0-py3-none-any.whl", hash = "sha256:cff9d19faa9072cfc19a04d11ac5e30d0e1a846bd1f843f05f37841941fe3e62", size = 643099, upload-time = "2026-08-29T02:04:07.519Z" },
+    { url = "https://files.pythonhosted.org/packages/87/97/13e9f23c875318189a1a7551925194ee9dc22499c2dbf93d56a646d26ca6/datamodel_code_generator-0.87.0-py3-none-any.whl", hash = "sha256:657f162c1a72881b14dc699e80a9c877975d825dfcb1e8823c75b65e869e1305", size = 1992519, upload-time = "2026-10-28T14:43:52.459Z" },
 ]
 
 [[package]]
@@ -3559,7 +3560,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [

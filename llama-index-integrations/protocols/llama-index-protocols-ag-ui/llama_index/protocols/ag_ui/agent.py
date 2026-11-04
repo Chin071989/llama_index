@@ -1,7 +1,7 @@
 import copy
 import json
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Collection, Dict, List, Optional, Union
 
 from ag_ui.core import RunAgentInput, Tool as AGUITool
 
@@ -155,6 +155,7 @@ class AGUIChatWorkflow(Workflow):
         frontend_tools: Optional[List[Union[BaseTool, Callable]]] = None,
         system_prompt: Optional[str] = None,
         initial_state: Optional[Dict[str, Any]] = None,
+        allowed_media_url_hosts: Optional[Collection[str]] = None,
         **workflow_kwargs: Any,
     ):
         super().__init__(**workflow_kwargs)
@@ -180,6 +181,9 @@ class AGUIChatWorkflow(Workflow):
         }
         self.initial_state = _copy_initial_state(initial_state)
         self.system_prompt = system_prompt
+        self.allowed_media_url_hosts = (
+            frozenset(allowed_media_url_hosts) if allowed_media_url_hosts else None
+        )
 
     def _snapshot_messages(self, ctx: Context, chat_history: List[ChatMessage]) -> None:
         # inject tool calls into the assistant message
@@ -214,7 +218,10 @@ class AGUIChatWorkflow(Workflow):
         if isinstance(ev, InputEvent):
             ag_ui_messages = ev.input_data.messages
             chat_history = [
-                ag_ui_message_to_llama_index_message(m) for m in ag_ui_messages
+                ag_ui_message_to_llama_index_message(
+                    m, allowed_url_hosts=self.allowed_media_url_hosts
+                )
+                for m in ag_ui_messages
             ]
 
             # State sometimes has unused messages, so we need to remove them

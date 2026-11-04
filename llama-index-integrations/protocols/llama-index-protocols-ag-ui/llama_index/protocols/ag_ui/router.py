@@ -1,4 +1,5 @@
-from typing import Callable, Dict, Any, List, Optional, Awaitable
+import logging
+from typing import Callable, Collection, Dict, Any, List, Optional, Awaitable
 
 from ag_ui.core import PROTOCOL_VERSION, RunAgentInput
 from fastapi import APIRouter
@@ -44,6 +45,8 @@ AG_UI_EVENTS = (
     CustomWorkflowEvent,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class AGUIWorkflowRouter:
     def __init__(self, workflow_factory: Callable[[], Awaitable[Workflow]]):
@@ -83,12 +86,15 @@ class AGUIWorkflowRouter:
                         run_id=input.run_id,
                     )
                 )
-            except Exception as e:
+            except Exception:
+                # Exception details (e.g. upstream URLs, status codes) are only
+                # logged server-side, never streamed to the client.
+                logger.exception("AG-UI workflow run failed")
                 yield workflow_event_to_sse(
                     RunErrorWorkflowEvent(
                         timestamp=timestamp(),
-                        message=str(e),
-                        code=str(type(e)),
+                        message="An internal error occurred while running the agent.",
+                        code="INTERNAL_ERROR",
                     )
                 )
                 await handler.cancel_run()
@@ -104,6 +110,7 @@ def get_default_workflow_factory(
     initial_state: Optional[Dict[str, Any]] = None,
     system_prompt: Optional[str] = None,
     timeout: Optional[float] = 120,
+    allowed_media_url_hosts: Optional[Collection[str]] = None,
 ) -> Callable[[], Workflow]:
     async def workflow_factory():
         return AGUIChatWorkflow(
@@ -113,6 +120,7 @@ def get_default_workflow_factory(
             initial_state=initial_state,
             system_prompt=system_prompt,
             timeout=timeout,
+            allowed_media_url_hosts=allowed_media_url_hosts,
         )
 
     return workflow_factory
@@ -126,8 +134,15 @@ def get_ag_ui_workflow_router(
     initial_state: Optional[Dict[str, Any]] = None,
     system_prompt: Optional[str] = None,
     timeout: Optional[float] = 120,
+    allowed_media_url_hosts: Optional[Collection[str]] = None,
 ) -> APIRouter:
     workflow_factory = workflow_factory or get_default_workflow_factory(
-        llm, frontend_tools, backend_tools, initial_state, system_prompt, timeout
+        llm,
+        frontend_tools,
+        backend_tools,
+        initial_state,
+        system_prompt,
+        timeout,
+        allowed_media_url_hosts,
     )
     return AGUIWorkflowRouter(workflow_factory).router

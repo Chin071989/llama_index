@@ -35,7 +35,10 @@ from typing import (
 
 import platformdirs
 import requests
-from urllib.parse import urlparse
+import ipaddress
+import socket
+from requests.adapters import HTTPAdapter
+from urllib.parse import urljoin, urlparse, urlunparse
 
 if TYPE_CHECKING:
     from nltk.tokenize import PunktSentenceTokenizer
@@ -623,6 +626,153 @@ async def async_unit_generator(x: Any) -> AsyncGenerator[Any, None]:
     yield x
 
 
+#: Set to a truthy value to let ``resolve_binary`` fetch URLs that resolve to
+#: loopback, private, link-local or other non-public addresses.
+ALLOW_PRIVATE_URLS_ENV = "LLAMA_INDEX_ALLOW_PRIVATE_URLS"
+#: Maximum number of bytes ``resolve_binary`` downloads from a URL.
+MAX_URL_FETCH_BYTES_ENV = "LLAMA_INDEX_MAX_URL_FETCH_BYTES"
+DEFAULT_MAX_URL_FETCH_BYTES = 50 * 1024 * 1024
+_MAX_URL_REDIRECTS = 10
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_FETCH_HEADERS = {
+    "User-Agent": "LlamaIndex/0.0 (https://llamaindex.ai; info@llamaindex.ai) llama-index-core/0.0"
+}
+
+
+def _allow_private_urls() -> bool:
+    return os.environ.get(ALLOW_PRIVATE_URLS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _max_url_fetch_bytes() -> int:
+    value = os.environ.get(MAX_URL_FETCH_BYTES_ENV)
+    return int(value) if value else DEFAULT_MAX_URL_FETCH_BYTES
+
+
+def _is_blocked_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast
+
+
+def _resolve_public_ip(hostname: str, port: int) -> str:
+    """Resolve ``hostname`` and return an address, rejecting non-public ones."""
+    try:
+        infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve host {hostname!r}") from e
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        raise ValueError(f"Could not resolve host {hostname!r}")
+    for address in addresses:
+        if _is_blocked_ip(ipaddress.ip_address(address.split("%", 1)[0])):
+            raise ValueError(
+                f"Refusing to fetch URL: host {hostname!r} resolves to a "
+                f"non-public address. Set {ALLOW_PRIVATE_URLS_ENV}=1 to allow it."
+            )
+    return sorted(addresses)[0]
+
+
+class _PinnedHostAdapter(HTTPAdapter):
+    """Connect to a pre-validated IP while verifying TLS for the original host."""
+
+    def __init__(self, hostname: str, **kwargs: Any) -> None:
+        self._hostname = hostname
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["server_hostname"] = self._hostname
+        kwargs["assert_hostname"] = self._hostname
+        super().init_poolmanager(*args, **kwargs)
+
+
+def _read_capped(response: requests.Response, max_bytes: int) -> bytes:
+    content_length = response.headers.get("Content-Length")
+    if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise ValueError(f"Response exceeds the {max_bytes} byte limit")
+    buffer = bytearray()
+    for chunk in response.iter_content(chunk_size=65536):
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            raise ValueError(f"Response exceeds the {max_bytes} byte limit")
+    return bytes(buffer)
+
+
+def _fetch_pinned(url: str) -> requests.Response:
+    """GET ``url`` without redirects, connecting only to a validated public IP."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Refusing to fetch URL with scheme {parsed.scheme!r}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Refusing to fetch URL without a host")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ip = _resolve_public_ip(hostname, port)
+    ip_host = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
+    pinned_url = urlunparse(parsed._replace(netloc=netloc))
+    host_header = f"{hostname}:{parsed.port}" if parsed.port else hostname
+
+    session = requests.Session()
+    # Proxies would re-resolve the host and bypass the IP check.
+    session.trust_env = False
+    if parsed.scheme == "https":
+        session.mount("https://", _PinnedHostAdapter(hostname))
+    try:
+        return session.get(
+            pinned_url,
+            headers={**_FETCH_HEADERS, "Host": host_header},
+            timeout=(60, 60),
+            allow_redirects=False,
+            stream=True,
+        )
+    finally:
+        session.close()
+
+
+def fetch_url_bytes(url: str, max_bytes: Optional[int] = None) -> bytes:
+    """
+    Fetch ``url`` with SSRF protections.
+
+    Only ``http``/``https`` URLs are allowed. Every redirect hop is resolved and
+    rejected if it points at a loopback, private, link-local, metadata or other
+    non-public address, and connections are pinned to the validated IP. The
+    body is capped at ``max_bytes`` (default ``LLAMA_INDEX_MAX_URL_FETCH_BYTES``
+    or 50 MiB). Set ``LLAMA_INDEX_ALLOW_PRIVATE_URLS=1`` to disable the address
+    checks for trusted deployments.
+    """
+    limit = max_bytes if max_bytes is not None else _max_url_fetch_bytes()
+
+    if _allow_private_urls():
+        if urlparse(url).scheme not in ("http", "https"):
+            raise ValueError("Refusing to fetch URL with a non-http(s) scheme")
+        response = requests.get(
+            url, headers=_FETCH_HEADERS, timeout=(60, 60), stream=True
+        )
+        try:
+            response.raise_for_status()
+            return _read_capped(response, limit)
+        finally:
+            response.close()
+
+    current = url
+    for _ in range(_MAX_URL_REDIRECTS + 1):
+        response = _fetch_pinned(current)
+        try:
+            location = response.headers.get("Location")
+            if response.status_code in _REDIRECT_STATUS_CODES and location:
+                current = urljoin(current, location)
+                continue
+            response.raise_for_status()
+            return _read_capped(response, limit)
+        finally:
+            response.close()
+    raise ValueError(f"Too many redirects while fetching URL (>{_MAX_URL_REDIRECTS})")
+
+
 def resolve_binary(
     raw_bytes: Optional[bytes] = None,
     path: Optional[Union[str, Path]] = None,
@@ -698,13 +848,9 @@ def resolve_binary(
                     # Return as text bytes
                     return BytesIO(url_data.encode("utf-8"))
 
-        headers = {
-            "User-Agent": "LlamaIndex/0.0 (https://llamaindex.ai; info@llamaindex.ai) llama-index-core/0.0"
-        }
-        response = requests.get(url, headers=headers, timeout=(60, 60))
-        response.raise_for_status()
+        content = fetch_url_bytes(url)
         if as_base64:
-            return BytesIO(base64.b64encode(response.content))
-        return BytesIO(response.content)
+            return BytesIO(base64.b64encode(content))
+        return BytesIO(content)
 
     raise ValueError("No valid source provided to resolve binary data!")

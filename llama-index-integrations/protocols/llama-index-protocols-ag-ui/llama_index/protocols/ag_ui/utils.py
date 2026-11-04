@@ -26,7 +26,8 @@ from ag_ui.core.types import (
     VideoPart,
 )
 from ag_ui.encoder import EventEncoder
-from typing import Any, List, Optional, Union, Callable
+from typing import Any, Collection, List, Optional, Union, Callable
+from urllib.parse import urlparse
 
 from llama_index.core.llms import ChatMessage
 from llama_index.core.base.llms.types import (
@@ -75,8 +76,24 @@ def _drop_none(**kwargs: Any) -> dict:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
+def _is_allowed_media_url(url: str, allowed_hosts: Optional[Collection[str]]) -> bool:
+    """Only https URLs whose host is explicitly allowlisted may be fetched."""
+    if not allowed_hosts:
+        return False
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not hostname:
+        return False
+    return hostname.lower() in {host.lower() for host in allowed_hosts}
+
+
 def _source_kwargs(
     source: PartSource,
+    allowed_url_hosts: Optional[Collection[str]] = None,
 ) -> dict:
     """
     Project an AG-UI input-content source onto block constructor kwargs.
@@ -87,12 +104,18 @@ def _source_kwargs(
     corrupts every payload whose raw form happens to decode as base64 (the
     block's ``resolve_*`` would then decode it a second time). Base64 input is
     always kept verbatim and decoded exactly once. A ``url`` source passes
-    through. Returns ``{}`` for a source this converter cannot read, so the
-    caller can skip the part with a warning.
+    through only when it is an https URL whose host is in
+    ``allowed_url_hosts``: the URL is later fetched server-side, so arbitrary
+    client URLs would allow SSRF. Returns ``{}`` for a source this converter
+    cannot read or does not allow, so the caller can skip the part with a
+    warning.
     """
     if isinstance(source, DataSource):
         return {"data": source.value.encode("ascii"), "mime_type": source.mime_type}
     if isinstance(source, UrlSource):
+        if not _is_allowed_media_url(source.value, allowed_url_hosts):
+            logger.warning("Rejecting media URL source whose host is not allowlisted")
+            return {}
         return {"url": source.value, "mime_type": source.mime_type}
     return {}
 
@@ -111,6 +134,7 @@ AG_UI_STATE_BLOCK_KEY = "ag_ui_injected_state_block"
 
 def agui_content_to_blocks(
     content: Union[str, List[ContentPart]],
+    allowed_url_hosts: Optional[Collection[str]] = None,
 ) -> List[ContentBlock]:
     """
     Convert AG-UI user-message content onto llama-index content blocks.
@@ -121,6 +145,8 @@ def agui_content_to_blocks(
     than silently stringified.
     Part ``metadata`` is deliberately not carried onto blocks: llama-index
     blocks have no field for it, and providers reject unknown content keys.
+    ``UrlSource`` parts are skipped unless they are https URLs whose host is in
+    ``allowed_url_hosts`` (none are allowed by default).
     """
     if isinstance(content, str):
         return [TextBlock(text=content)]
@@ -139,7 +165,7 @@ def agui_content_to_blocks(
         if isinstance(part, TextPart):
             blocks.append(TextBlock(text=part.text))
         elif isinstance(part, ImagePart):
-            kwargs = _source_kwargs(part.source)
+            kwargs = _source_kwargs(part.source, allowed_url_hosts)
             if not kwargs:
                 logger.warning("Skipping image part with unreadable source")
                 continue
@@ -153,7 +179,7 @@ def agui_content_to_blocks(
                 )
             )
         elif isinstance(part, AudioPart):
-            kwargs = _source_kwargs(part.source)
+            kwargs = _source_kwargs(part.source, allowed_url_hosts)
             if not kwargs:
                 logger.warning("Skipping audio part with unreadable source")
                 continue
@@ -167,7 +193,7 @@ def agui_content_to_blocks(
                 )
             )
         elif isinstance(part, VideoPart):
-            kwargs = _source_kwargs(part.source)
+            kwargs = _source_kwargs(part.source, allowed_url_hosts)
             if not kwargs:
                 logger.warning("Skipping video part with unreadable source")
                 continue
@@ -181,7 +207,7 @@ def agui_content_to_blocks(
                 )
             )
         elif isinstance(part, DocumentPart):
-            kwargs = _source_kwargs(part.source)
+            kwargs = _source_kwargs(part.source, allowed_url_hosts)
             if not kwargs:
                 logger.warning("Skipping document part with unreadable source")
                 continue
@@ -354,7 +380,9 @@ def llama_index_message_to_ag_ui_message(
         raise ValueError(f"Unknown message role: {message.role}")
 
 
-def ag_ui_message_to_llama_index_message(message: Message) -> ChatMessage:
+def ag_ui_message_to_llama_index_message(
+    message: Message, allowed_url_hosts: Optional[Collection[str]] = None
+) -> ChatMessage:
     if isinstance(message, SystemMessage):
         return ChatMessage(
             role="system", content=message.content, additional_kwargs={"id": message.id}
@@ -368,7 +396,7 @@ def ag_ui_message_to_llama_index_message(message: Message) -> ChatMessage:
         content = message.content if message.content is not None else ""
         return ChatMessage(
             role="user",
-            blocks=agui_content_to_blocks(content),
+            blocks=agui_content_to_blocks(content, allowed_url_hosts),
             additional_kwargs=kwargs,
         )
     elif isinstance(message, AssistantMessage):
